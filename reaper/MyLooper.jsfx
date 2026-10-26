@@ -1,0 +1,1098 @@
+desc:MyLooper - 8-section tempo-synced looper, controlled from iPad (inspired by Cockos Super8)
+//author: Antonio
+//tags: looper
+//
+// One instance per track (= one instrument). Each instance has 8 stereo SECTIONS.
+//
+// Loop lengths:
+//   Every section has ITS OWN length, fixed when its take is recorded.
+//   Halve / double (6/7) change the "rec length" = the length of the NEXT new take;
+//   sections already recorded keep their length. All lengths are tempo-synced and
+//   locked to the project timeline, so a 1-bar and a 2-bar section stay in phase.
+//   Section halve / double (11/12) change the length of ONE section without losing
+//   audio: halving keeps the rest of the take, doubling back restores it (doubling
+//   beyond the recorded content repeats the loop).
+//
+// Mode:
+//   Immediate = commands run as soon as they arrive (classic Super8 behaviour)
+//   Bar       = commands wait for the end of the loop of that section:
+//               - a new take starts on the next multiple of the rec length
+//               - play / stop / end of rec / overdub wait for the end of the
+//                 section's own loop
+//               A command arriving within "Late grace" ms AFTER that point runs at
+//               once and is corrected retroactively: a late REC also captures what
+//               you played since the downbeat (pre-roll buffer), a late end-of-REC
+//               removes the extra audio.
+//
+// Section states: 0 empty, 1 stopped, 2 playing, 3 recording (new take), 4 overdub
+// Pending action: 0 none, 1 stop, 2 play, 3 rec
+//
+// Control: gmem "MyLooper", written by MyLooper_bridge.lua (which also assigns
+// Looper ID = order of the track in the project). Layout per looper, base = ID*1024:
+//   +0 heartbeat  +1 rec length (beats)  +2 mode  +3 rec-grid pos (0..1)  +4 running
+//   +5 ts_num  +6 rec length (secs)  +7 monitor  +8 can double  +9 ts_denom
+//   +10 max loop length (secs)  +11 protocol version (10)
+//   +12 undo section (-1 = none)  +13 undo state (0 none, 1 undo, 2 redo)
+//   +112..115 looper filter, low, mid, high   +116 fade kind (1 out, 2 in)
+//   +120+s*6: filter, low, mid, high, fade gain, fade kind  (per section)
+//   +14 fade gain (1 = none)  +15 fade out running (bars, 0 = none)
+//   +16+s*12: state, pending, has content, level, pos (0..1), beats, secs,
+//             volume (0..2), pan (-1..1), mute, cue                      (s = 0..7)
+//   +512: command write index (bridge)   +520+k*4: code, arg   (ring of 64)
+// Commands (arg = s + 8*value where a value is needed):
+//   1 tap(s, late_ms) 2 hold/rec(s) 3 play all 4 stop all 5 mode(a)
+//   6 halve rec length 7 double rec length 8 clear all 9 clear section(s)
+//   10 toggle monitor 11 halve section(s) 12 double section(s)
+//   13 volume(s, percent 0..200) 14 pan(s, 0..200 = L..R) 15 toggle mute(s)
+//   16 undo / redo 17 set rec length (a = beats*2)
+//   18 silent rec(s): records on the cue bus and ends in pause
+//   19 toggle cue(s): where the section plays, main or cue (your in-ears)
+//   20 fade looper(a = bars*2 + dir): Bar mode only, dir 0 = out, 1 = in.
+//      Fades over bars (1/8 .. 32) landing on the grid; a fade out ends with
+//      everything in pause, a fade in starts the sections. Sent again = cancel.
+//   21 fade section(s + 8*(bars*2 + dir)): the same on one section only
+//   22 tap now(s): play / pause right away, ignoring the bar (double tap)
+//   23 looper filter(0..200, 100 = off)   24 looper EQ(band + 3*gain, gain 0..200)
+//   25 section filter(s + 8*(0..200))     26 section EQ(s + 8*(band + 3*gain))
+//   27 reset filter+EQ (0 = looper, 1+s = section, 9 = everything)
+//   28 book an action for an exact beat (scaletta):
+//      s + 8*act + 64*(beat*2), act 1 = pause, 2 = play, 3 = rec, 4 = silent rec
+//      (act 0 cancels what was booked for that section)
+//   30 set the length of a section: s + 8*(beats*2)
+//   late_ms = how long the UI held the tap back (to tell it from a double tap):
+//   it widens the late-press grace for that command.
+//
+// Undo: one level per looper, like a hardware looper. The last rec / overdub can be
+// undone (and redone). The previous audio is copied, cell by cell, while it gets
+// overwritten, so starting a rec costs nothing.
+//
+// Audio transfer (save / load, used by the bridge), gmem XF = 18432:
+//   +0 request seq  +1 done seq  +2 op  +3 looper id  +4 section  +5 offset  +6 frames
+//   +7 beats  +8 content beats  +9 volume  +10 pan  +11 mute  +21 cue  (inputs)
+//   +12 valid  +13 beats  +14 content beats  +15 content frames
+//   +16 volume  +17 pan  +18 mute  +19 srate  +22 cue                 (info output)
+//   +32.. interleaved L/R samples (max 16384 frames)
+//   ops: 1 read audio  2 write audio  3 finish load  4 info  5 clear section
+//
+// Local UI (plugin window): left click = tap, right click = rec.
+//
+// Cue bus (outputs 3/4): the input monitoring moves there while a silent rec is
+// running (command 18), and any section you route there by hand (command 19)
+// plays there instead of on the main outputs.
+// Set the track to 4 channels and send channels 3/4 wherever your in-ears are fed
+// from; with only 2 channels a cue section is simply silent.
+//
+// NB: REAPER transport must be PLAYING for the loops to run (positions follow
+// the project timeline, so all tracks stay in sync).
+
+options:maxmem=33000000 gmem=MyLooper no_meter
+
+slider1:looper_id=0<0,16,1>-Looper ID (assigned by MyLooper_bridge.lua)
+slider2:quant_mode=1<0,1,1{Immediate,Bar (end of loop)}>Mode
+slider3:len_beats=0<0,256,0.5>-Rec length in beats (0 = 1 bar)
+slider4:grace_ms=150<0,300,1>Late-press grace (ms)
+slider5:monitor=1<0,1,1{Off,On}>Input monitoring
+slider6:loop_db=0<-24,12,0.1>Loop volume (dB)
+
+in_pin:Input L
+in_pin:Input R
+out_pin:Output L
+out_pin:Output R
+out_pin:Cue L
+out_pin:Cue R
+
+@init
+NSEC = 8;
+PR_LEN = 65536;                 // pre-roll ring (input history), ~1.3s @48k
+PRL = 0;
+PRR = PR_LEN;
+BUF0 = 2 * PR_LEN;
+// 8 sections + 1 undo buffer, stereo
+MAXLEN = floor((33000000 - BUF0 - 1024) / ((NSEC + 1) * 2)); // samples per buffer/channel
+UBL = BUF0 + NSEC * 2 * MAXLEN;   // undo buffer L
+UBR = UBL + MAXLEN;               // undo buffer R
+// NB: EEL is case-insensitive, so no name here may clash with a lowercase variable
+SECMEM = UBR + MAXLEN;
+STATE = SECMEM;       PEND = SECMEM + 8;    VALID = SECMEM + 16;
+FRESH = SECMEM + 24;  GAIN = SECMEM + 32;   LVL = SECMEM + 40;
+SLEN = SECMEM + 48;   // section length (samples), 0 = empty
+SBEATS = SECMEM + 56; // section length (beats)
+SPOS = SECMEM + 64;   // section position (samples)
+GPP = SECMEM + 72;    // previous grid position of a pending section (-1 = none)
+CBEATS = SECMEM + 80; // length of the recorded content (beats) - kept on halve
+SVOL = SECMEM + 88;   // section volume (linear, 1 = 0 dB)
+SPAN = SECMEM + 96;   // section pan (-1 L .. +1 R)
+SMUTE = SECMEM + 104; // section mute
+CGL = SECMEM + 112;   // smoothed L gain (volume * pan)
+CGR = SECMEM + 120;   // smoothed R gain
+CUEF = SECMEM + 128;  // 1 = the section plays on the cue bus only
+RECPAUSE = SECMEM + 136; // 1 = this rec ends in pause (silent rec)
+// per-section fade (the looper-wide one lives in fd_*)
+SFON = SECMEM + 144;  // 0 none, 1 fade out, 2 fade in
+SFB0 = SECMEM + 152;  // beat position where the fade started
+SFB1 = SECMEM + 160;  // beat position where it ends
+SFG = SECMEM + 168;   // current fade gain of the section (1 = none)
+SFST = SECMEM + 176;  // per-sample step towards the target of this block
+// per-section DJ filter + 3 band kill (see fx_*)
+SFIL = SECMEM + 184;  // filter knob: -1 low pass .. 0 off .. +1 high pass
+SEQL = SECMEM + 192;  // low gain   (1 = flat, 0 = killed, up to 2)
+SEQM = SECMEM + 200;  // mid gain
+SEQH = SECMEM + 208;  // high gain
+SFXON = SECMEM + 216; // 1 = this section is not at the default settings
+SFILC = SECMEM + 224; // the same four, smoothed (no clicks when you move them)
+SEQLC = SECMEM + 232;
+SEQMC = SECMEM + 240;
+SEQHC = SECMEM + 248;
+SFC = SECMEM + 256;   // filter coefficient for this block
+SFMODE = SECMEM + 264; // -1 low pass, 0 off, +1 high pass
+// filter / EQ states: [s*2 + ch] for the sections, 16/17 for the looper bus
+FZ1 = SECMEM + 272;
+FZ2 = SECMEM + 296;
+EL = SECMEM + 320;    // one pole state, low band
+EH = SECMEM + 344;    // one pole state, low+mid band
+// scheduled action (the "scaletta" sets them in advance, see command 28)
+SCHA = SECMEM + 368;  // action waiting for its beat: 1 pause, 2 play, 3 rec, 4 cue rec
+SCHB = SECMEM + 376;  // beat of the project timeline it has to happen at
+// Where the loop of each section starts, in quarter notes of the timeline. A take
+// recorded by hand starts on its grid (so this is a multiple of its length, like
+// before); a take started by the scaletta at bar 2 keeps bar 2 as its start, so it
+// loops 2-6-10 instead of being forced onto 1-5-9 (which recorded it rotated).
+SPHB = SECMEM + 384;
+SECEND = SECMEM + 392;
+XF = 18432;           // gmem audio transfer area
+
+ext_noinit == 0 ? (
+  ext_noinit = 1;
+  memset(SECMEM, 0, SECEND - SECMEM);
+  memset(GPP, -1, 8);
+  memset(SVOL, 1, 8); memset(CGL, 1, 8); memset(CGR, 1, 8);
+  memset(SFG, 1, 8); memset(SEQL, 1, 8); memset(SEQM, 1, 8); memset(SEQH, 1, 8);
+  memset(SEQLC, 1, 8); memset(SEQMC, 1, 8); memset(SEQHC, 1, 8);
+  usec = -1; ustate = 0; ufresh = 0; ulen = 0; uswap = -1;
+  fd_on = 0; fd_bars = 0; fd_g = 1; fd_tgt = 1; fd_step = 0; fd_b0 = 0; fd_b1 = 0;
+  lfil = 0; leql = 1; leqm = 1; leqh = 1; lfxon = 0;
+  lfilc = 0; leqlc = 1; leqmc = 1; leqhc = 1; lfc = 0; lfmode = 0;
+  pos = 0; pr_w = 0; len = 0;
+  ridx = 0; last_id = -1;
+  ui_cmd = 0; ui_arg = 0;
+);
+
+function bufl(s) ( BUF0 + s * 2 * MAXLEN );
+function bufr(s) ( BUF0 + s * 2 * MAXLEN + MAXLEN );
+function cur_beats() ( len_beats > 0 ? len_beats : ts_num );
+function beats_to_len(b) ( min(max(floor(b * spb + 0.5), 32), MAXLEN) );
+
+// position (in samples) of a length of b beats on the project timeline
+function timeline_pos(b, n) local(lq, bp, p)
+(
+  lq = b * 4 / ts_denom;
+  bp = beat_position - floor(beat_position / lq) * lq;
+  p = floor(bp * 60 / tempo * srate + 0.5);
+  p >= n ? p -= n;
+  max(p, 0);
+);
+
+function timeline_pos_ph(b, n, ph) local(lq, bp, p, x)
+(
+  lq = b * 4 / ts_denom;
+  x = beat_position - ph;
+  bp = x - floor(x / lq) * lq;
+  p = floor(bp * 60 / tempo * srate + 0.5);
+  p >= n ? p -= n;
+  max(p, 0);
+);
+
+// the exact position of the timeline right now, also from inside @sample
+function now_qn() ( beat_position + smp_i / srate * tempo / 60 );
+
+function update_len() local(s)
+(
+  spb = srate * 240 / (tempo * ts_denom);       // samples per beat (1/ts_denom note)
+  len = beats_to_len(cur_beats());
+  pos >= len ? pos = pos % len;
+  s = 0;
+  loop(NSEC,
+    SBEATS[s] > 0 ? (
+      SLEN[s] = beats_to_len(SBEATS[s]);
+      SPOS[s] >= SLEN[s] ? SPOS[s] = SPOS[s] % SLEN[s];
+    );
+    s += 1;
+  );
+);
+
+// grid used to quantize action act on section s: the rec length for a new take,
+// otherwise the section's own loop
+function new_take(s, act) ( act == 3 && STATE[s] <= 1 );
+function grid_pos(s, act) ( new_take(s, act) || SLEN[s] <= 0 ? pos : SPOS[s] );
+function grid_len(s, act) ( new_take(s, act) || SLEN[s] <= 0 ? len : SLEN[s] );
+
+// apply the last d input samples (pre-roll) to cells 0..d-1 of section s
+// mode: 0 = overwrite, 1 = add, -1 = subtract
+function retro(s, d, mode) local(bl, br, k, i)
+(
+  d = min(d|0, SLEN[s]);
+  d > 0 ? (
+    bl = bufl(s); br = bufr(s);
+    i = pr_w - d; i < 0 ? i += PR_LEN;
+    k = 0;
+    loop(d,
+      mode == 0 ? (
+        bl[k] = PRL[i]; br[k] = PRR[i];
+      ) : (
+        bl[k] += mode * PRL[i]; br[k] += mode * PRR[i];
+      );
+      k += 1;
+      (i += 1) >= PR_LEN ? i = 0;
+    );
+  );
+);
+
+// zero the cells of a new take that were never recorded
+function flush_fresh(s) local(bl, br, n1, n2, p, n)
+(
+  n = SLEN[s];
+  FRESH[s] > 0 && n > 0 ? (
+    bl = bufl(s); br = bufr(s);
+    p = SPOS[s];
+    n1 = min(FRESH[s], n - p);
+    n1 > 0 ? ( memset(bl + p, 0, n1); memset(br + p, 0, n1); );
+    (n2 = min(FRESH[s] - n1, p)) > 0 ? ( memset(bl, 0, n2); memset(br, 0, n2); );
+  );
+  FRESH[s] = 0;
+);
+
+// ---------- undo (one level per looper) ----------
+// usec: section, ustate: 0 none / 1 undo available / 2 redo available,
+// ulen: frames kept, ufresh: cells still to copy while recording, uswap: swap progress
+function undo_invalidate(s) ( s < 0 || s == usec ? ( usec = -1; ustate = 0; ufresh = 0; uswap = -1; ); );
+
+function undo_finish_swap() local(s, t)
+(
+  s = usec;
+  t = SBEATS[s]; SBEATS[s] = ub_sbeats; ub_sbeats = t;
+  t = CBEATS[s]; CBEATS[s] = ub_cbeats; ub_cbeats = t;
+  t = VALID[s];  VALID[s] = ub_valid;   ub_valid = t;
+  t = SPHB[s];   SPHB[s] = ub_phase;   ub_phase = t;
+  FRESH[s] = 0;
+  SBEATS[s] > 0 ? ( SLEN[s] = beats_to_len(SBEATS[s]); ) : ( SLEN[s] = 0; );
+  // keep play / pause as it was; an emptied section is just empty
+  VALID[s] > 0 ? ( STATE[s] == 0 ? STATE[s] = 1; ) : ( STATE[s] = 0; );
+  ustate = 3 - ustate;
+  uswap = -1;
+);
+
+// swap up to maxn frames of the kept audio with the section (undo / redo)
+function undo_swap_step(maxn) local(n, i, l, r, t)
+(
+  uswap >= 0 && usec >= 0 ? (
+    n = min(maxn, ulen - uswap);
+    n > 0 ? (
+      i = uswap;
+      l = bufl(usec); r = bufr(usec);
+      loop(n,
+        t = l[i]; l[i] = UBL[i]; UBL[i] = t;
+        t = r[i]; r[i] = UBR[i]; UBR[i] = t;
+        i += 1;
+      );
+      uswap += n;
+    );
+    uswap >= ulen ? undo_finish_swap();
+  );
+);
+
+// a rec is about to start on s (before any cell is modified); n = frames of the take
+function undo_begin(s, n, d) local(bl, br)
+(
+  uswap >= 0 ? undo_swap_step(ulen);   // an undo still being applied: finish it first
+  usec = s;
+  ustate = 0;
+  ulen = n;
+  ub_sbeats = SBEATS[s]; ub_cbeats = CBEATS[s]; ub_valid = VALID[s]; ub_phase = SPHB[s];
+  bl = bufl(s); br = bufr(s);
+  d = min(d|0, n);
+  d > 0 ? ( memcpy(UBL, bl, d); memcpy(UBR, br, d); );
+  ufresh = n - d;               // the rest is copied as the rec goes over it
+);
+
+// the rec on s ended: copy the cells it never reached
+function undo_seal(s) local(bl, br, p, n1, n2)
+(
+  s == usec && ustate == 0 ? (
+    ufresh > 0 ? (
+      bl = bufl(s); br = bufr(s);
+      p = min(SPOS[s], ulen);
+      n1 = min(ufresh, ulen - p);
+      n1 > 0 ? ( memcpy(UBL + p, bl + p, n1); memcpy(UBR + p, br + p, n1); );
+      (n2 = min(ufresh - n1, p)) > 0 ? ( memcpy(UBL, bl, n2); memcpy(UBR, br, n2); );
+      ufresh = 0;
+    );
+    ustate = 1;
+  );
+);
+
+// ---------- mixer ----------
+function set_vol(s, pc) ( SVOL[s] = max(0, min(200, pc)) / 100; );
+function set_pan(s, v)  ( SPAN[s] = max(-1, min(1, (v - 100) / 100)); );
+
+// run an action now; d = samples elapsed since the grid point (for late presses)
+function exec(s, act, d) local(st)
+(
+  st = STATE[s];
+  PEND[s] = 0;
+  GPP[s] = -1;
+  act == 3 ? (
+    st == 2 ? (
+      undo_begin(s, SLEN[s], d);
+      retro(s, d, 1);                     // overdub on top of what is playing
+      STATE[s] = 4;
+    ) : st <= 1 ? (
+      undo_begin(s, len, d);
+      CUEF[s] ? cue_rec = 1;              // silent rec: monitor moves to the cue bus now
+      SBEATS[s] = cur_beats();            // new take: gets the current rec length
+      CBEATS[s] = SBEATS[s];
+      SLEN[s] = len;
+      // the take started d samples ago: that is where its loop starts from now on
+      ph_q = cur_beats() * 4 / ts_denom;
+      ph = now_qn() - d / srate * tempo / 60;
+      ph_k = floor(ph / ph_q + 0.5);
+      abs(ph - ph_k * ph_q) < 0.01 ? ph = ph_k * ph_q;   // on the grid: keep it exact
+      SPHB[s] = ph;
+      SPOS[s] = min(d|0, len - 1);
+      retro(s, d, 0);
+      FRESH[s] = len - min(d|0, len);
+      STATE[s] = 3;
+      VALID[s] = 1;
+    );
+  ) : act == 2 ? (
+    st >= 3 ? (
+      retro(s, d, -1);                    // remove what was recorded after the loop end
+      undo_seal(s);
+      // a silent rec ends in pause, and the section goes back to the main outs:
+      // from here on it is an ordinary section
+      RECPAUSE[s] ? ( STATE[s] = 1; CUEF[s] = 0; RECPAUSE[s] = 0; ) : ( STATE[s] = 2; );
+    ) : VALID[s] > 0 ? (
+      STATE[s] = 2;
+    );
+  ) : act == 1 ? (
+    st >= 3 ? ( retro(s, d, -1); undo_seal(s); );
+    RECPAUSE[s] ? ( CUEF[s] = 0; RECPAUSE[s] = 0; );
+    flush_fresh(s);
+    STATE[s] = VALID[s] > 0 ? 1 : 0;
+  );
+);
+
+function exec_pending_now() local(s)
+(
+  s = 0;
+  loop(NSEC, PEND[s] ? exec(s, PEND[s], 0); s += 1; );
+);
+
+// undo / redo; the audio is swapped in chunks (see @block) so a long loop never causes a dropout
+function undo_toggle() local(s)
+(
+  s = usec;
+  s >= 0 && uswap < 0 ? (
+    STATE[s] >= 3 ? exec(s, 2, 0);    // still recording: close the rec first
+    ustate > 0 ? ( uswap = 0; PEND[s] = 0; );
+  );
+);
+
+function request(s, act) local(gp)
+(
+  gp = grid_pos(s, act);
+  quant_mode < 0.5 ? (
+    exec(s, act, 0);
+  ) : running && gp < grace_spls + extra_grace ? (
+    exec(s, act, gp);                     // just after the grid point: do it now
+  ) : (
+    PEND[s] = act;                        // wait for the end of the loop
+    GPP[s] = running ? gp : -1;
+  );
+);
+
+// single tap: rec -> play, play -> stop, stopped -> play. Tap on pending = cancel.
+function tap(s) local(st)
+(
+  PEND[s] ? (
+    PEND[s] = 0;
+    // a silent rec that never started: forget the cue routing too
+    RECPAUSE[s] && STATE[s] < 3 ? ( CUEF[s] = 0; RECPAUSE[s] = 0; );
+  ) : (
+    st = STATE[s];
+    // a silent rec ends on the spot: nobody is listening to it, so there is
+    // nothing to wait for - it goes straight to pause
+    st >= 3 ? ( RECPAUSE[s] ? exec(s, 1, 0) : request(s, 2) ) :
+    st == 2 ? request(s, 1) :
+    VALID[s] > 0 ? request(s, 2);
+  );
+);
+
+// long press: record (new take if stopped/empty, overdub if playing)
+function hold(s)
+(
+  PEND[s] == 3 ? ( PEND[s] = 0; ) : ( STATE[s] < 3 ? request(s, 3); );
+);
+
+// silent rec: only the recording happens on the cue bus (the audience hears
+// nothing of what you play); when it ends the section is an ordinary one, in
+// pause and routed to the main outs, ready to be launched with a tap
+function hold_cue(s)
+(
+  PEND[s] == 3 ? ( PEND[s] = 0; RECPAUSE[s] = 0; CUEF[s] = 0; ) : ( STATE[s] < 2 ? (
+    CUEF[s] = 1;
+    RECPAUSE[s] = 1;
+    request(s, 3);
+  ) : ( hold(s); ); );
+);
+
+function set_cue(s, v) ( CUEF[s] = v ? 1 : 0; );
+
+function play_all() local(s)
+(
+  s = 0;
+  loop(NSEC,
+    VALID[s] > 0 && STATE[s] < 2 && PEND[s] != 2 ? request(s, 2);
+    s += 1;
+  );
+);
+
+function stop_all() local(s)
+(
+  s = 0;
+  loop(NSEC,
+    STATE[s] >= 2 ? ( request(s, 1); ) : ( PEND[s] = 0; );
+    s += 1;
+  );
+);
+
+function set_mode(m)
+(
+  quant_mode = m;
+  sliderchange(quant_mode);
+  m == 0 ? exec_pending_now();
+);
+
+// halve / double change only the length of the NEXT new take
+function set_beats(b)
+(
+  len_beats = b;
+  sliderchange(len_beats);
+  update_len();
+);
+function do_halve() local(b) ( b = cur_beats() * 0.5; b >= 0.5 ? set_beats(b); );
+function do_double() local(b) ( b = cur_beats() * 2; floor(b * spb + 0.5) <= MAXLEN ? set_beats(b); );
+
+// halve / double ONE section, never destroying audio
+function sec_halve(s) local(b)
+(
+  b = SBEATS[s] * 0.5;
+  VALID[s] > 0 && STATE[s] != 3 && b >= 0.5 ? (
+    SBEATS[s] = b;
+    update_len();
+  );
+);
+
+function sec_double(s) local(b, nl, ol, cl, bl, br, n)
+(
+  b = SBEATS[s] * 2;
+  nl = floor(b * spb + 0.5);
+  VALID[s] > 0 && STATE[s] != 3 && nl <= MAXLEN ? (
+    b > CBEATS[s] ? (
+      // longer than what was recorded: repeat the loop, keeping the content already there
+      ol = SLEN[s];
+      cl = floor(CBEATS[s] * spb + 0.5);
+      bl = bufl(s); br = bufr(s);
+      n = min(nl - ol, ol);
+      ol >= cl ? (
+        memcpy(bl + ol, bl, n);
+        memcpy(br + ol, br, n);
+        undo_invalidate(s);
+      );
+      CBEATS[s] = b;
+    );
+    SBEATS[s] = b;
+    update_len();
+  );
+);
+
+function clear_sec(s)
+(
+  STATE[s] = 0; PEND[s] = 0; VALID[s] = 0; FRESH[s] = 0;
+  SLEN[s] = 0; SBEATS[s] = 0; CBEATS[s] = 0; SPOS[s] = 0; GPP[s] = -1;
+  SVOL[s] = 1; SPAN[s] = 0; SMUTE[s] = 0; CUEF[s] = 0; RECPAUSE[s] = 0;
+  SPHB[s] = 0;
+  undo_invalidate(s);
+);
+function clear_all() local(s) ( s = 0; loop(NSEC, clear_sec(s); s += 1; ); );
+
+// ---------- DJ filter + 3 band EQ ----------
+// The filter knob is the classic DJ sweep: left = low pass (down to 80 Hz),
+// right = high pass (up to 4 kHz), centre = off. The three bands are a kill EQ
+// (0 = band gone, 1 = flat, 2 = +6 dB) built on a one pole split, so with every
+// band at 1 the sum is exactly the input again.
+function fx_coef(k) local(fc)
+(
+  k < 0 ? ( fc = 20000 * exp(log(0.004) * -k); ) : ( fc = 20 * exp(log(200) * k); );
+  fc = min(fc, srate * 0.45);
+  tan($pi * fc / srate);
+);
+
+// one channel: EQ then filter. i = state index (s*2+ch, or 16/17 for the looper)
+function fx_run(x, i, fmode, fgg, gl, gm, gh) local(lo, hi, mid, y, hp, bp, lp)
+(
+  EL[i] += (x - EL[i]) * eq_a1;
+  EH[i] += (x - EH[i]) * eq_a2;
+  lo = EL[i];
+  hi = x - EH[i];
+  mid = EH[i] - EL[i];
+  y = lo * gl + mid * gm + hi * gh;
+  fmode ? (
+    hp = (y - (fx_r2 + fgg) * FZ1[i] - FZ2[i]) / (1 + fx_r2 * fgg + fgg * fgg);
+    bp = fgg * hp + FZ1[i]; FZ1[i] = fgg * hp + bp;
+    lp = fgg * bp + FZ2[i]; FZ2[i] = fgg * bp + lp;
+    y = fmode < 0 ? lp : hp;
+  );
+  y;
+);
+
+function set_sec_filter(s, v) ( SFIL[s] = max(-1, min(1, (v - 100) / 100)); );
+function set_sec_eq(s, band, v) local(g)
+(
+  g = max(0, min(2, v / 100));
+  band == 0 ? SEQL[s] = g : band == 1 ? SEQM[s] = g : SEQH[s] = g;
+);
+function set_looper_filter(v) ( lfil = max(-1, min(1, (v - 100) / 100)); );
+function set_looper_eq(band, v) local(g)
+(
+  g = max(0, min(2, v / 100));
+  band == 0 ? leql = g : band == 1 ? leqm = g : leqh = g;
+);
+function fx_reset_sec(s) ( SFIL[s] = 0; SEQL[s] = 1; SEQM[s] = 1; SEQH[s] = 1; );
+function fx_reset(a) local(s)
+(
+  a == 0 ? ( lfil = 0; leql = 1; leqm = 1; leqh = 1; ) :
+  a == 9 ? ( lfil = 0; leql = 1; leqm = 1; leqh = 1; s = 0; loop(NSEC, fx_reset_sec(s); s += 1; ); ) :
+  fx_reset_sec(a - 1);
+);
+
+// ---------- fade in / fade out ----------
+// Both land on the grid: from 1 bar up on a bar line, below that on the fade
+// itself (half a bar lands mid bar). At the end of a fade OUT everything goes to
+// pause; a fade IN starts the sections that have content and comes up from zero.
+function fade_grid(bars) local(bb, u, b1)
+(
+  bb = ts_num * 4 / ts_denom;              // quarter notes in one bar
+  u = min(bars, 1) * bb;
+  b1 = (floor(beat_position / u) + 1) * u + max(0, bars - 1) * bb;
+  b1 - beat_position < u * 0.125 ? b1 += u; // pressed right before the line: one grid more
+  b1;
+);
+
+function play_all_now() local(s)
+(
+  s = 0;
+  loop(NSEC, VALID[s] > 0 && STATE[s] < 2 ? exec(s, 2, 0); s += 1; );
+);
+
+// h = length in half bars, dir 0 = out, 1 = in. Sent again while running = cancel.
+function fade_run(h, dir) local(bars)
+(
+  quant_mode ? (
+    fd_on ? (
+      fd_on = 0; fd_bars = 0;
+    ) : (
+      bars = max(0.125, min(64, h / 2));
+      fd_b0 = beat_position;
+      fd_b1 = fade_grid(bars);
+      fd_on = dir ? 2 : 1;
+      fd_bars = bars;
+      dir ? ( fd_g = 0; play_all_now(); );
+    );
+  );
+);
+
+function fade_end() local(s)
+(
+  fd_on = 0; fd_bars = 0;
+  s = 0;
+  loop(NSEC, exec(s, 1, 0); s += 1; );        // everything in pause, exactly on the grid
+);
+
+// the same for one section only
+function fade_sec(s, h, dir) local(bars)
+(
+  quant_mode ? (
+    SFON[s] ? (
+      SFON[s] = 0;
+    ) : (
+      bars = max(0.125, min(64, h / 2));
+      SFB0[s] = beat_position;
+      SFB1[s] = fade_grid(bars);
+      SFON[s] = dir ? 2 : 1;
+      dir ? (
+        SFG[s] = 0;
+        VALID[s] > 0 && STATE[s] < 2 ? exec(s, 2, 0);
+      ) : (
+        VALID[s] > 0 && STATE[s] < 2 ? SFON[s] = 0;   // nothing to fade out
+      );
+    );
+  );
+);
+
+// Set the length of one section to an exact number of beats (the UI can type it).
+// Shorter keeps the whole take (like the ½), longer repeats it (like the ×2).
+function sec_set_beats(s, b) local(nl, ol, cl, bl, br, n)
+(
+  b = max(0.5, b);
+  nl = floor(b * spb + 0.5);
+  VALID[s] > 0 && STATE[s] != 3 && nl <= MAXLEN ? (
+    b > CBEATS[s] ? (
+      ol = SLEN[s];
+      cl = floor(CBEATS[s] * spb + 0.5);
+      bl = bufl(s); br = bufr(s);
+      n = min(nl - ol, ol);
+      ol >= cl && n > 0 ? (
+        memcpy(bl + ol, bl, n);
+        memcpy(br + ol, br, n);
+        undo_invalidate(s);
+      );
+      CBEATS[s] = b;
+    );
+    SBEATS[s] = b;
+    update_len();
+  );
+);
+
+// An action booked for an exact beat of the timeline: the bridge sends it in
+// advance and the JSFX fires it on the right audio block, so a scaletta is as
+// tight as playing it by hand (the late-press correction does the rest).
+function sched_sec(s, act, beat)
+(
+  act ? ( SCHA[s] = act; SCHB[s] = beat; ) : ( SCHA[s] = 0; );
+);
+
+// double tap: play / pause right now, without waiting for the end of the bar
+function tap_now(s) local(st)
+(
+  PEND[s] ? (
+    PEND[s] = 0;
+    RECPAUSE[s] && STATE[s] < 3 ? ( CUEF[s] = 0; RECPAUSE[s] = 0; );
+  ) : (
+    st = STATE[s];
+    st >= 3 ? exec(s, RECPAUSE[s] ? 1 : 2, 0) :
+    st == 2 ? exec(s, 1, 0) :
+    VALID[s] > 0 ? exec(s, 2, 0);
+  );
+);
+
+function handle(c, raw) local(a, v)
+(
+  raw = max(0, raw|0);
+  c == 5 || c == 17 || c == 20 || c == 23 || c == 24 ? ( a = raw; v = 0; ) :
+    ( a = raw % 8; v = floor(raw / 8); );
+  extra_grace = c == 1 ? floor(min(v, 1000) * 0.001 * srate) : 0;
+  c == 1 ? tap(a) :
+  c == 2 ? hold(a) :
+  c == 3 ? play_all() :
+  c == 4 ? stop_all() :
+  c == 5 ? set_mode(a ? 1 : 0) :
+  c == 6 ? do_halve() :
+  c == 7 ? do_double() :
+  c == 8 ? clear_all() :
+  c == 9 ? clear_sec(a) :
+  c == 10 ? ( monitor = !monitor; sliderchange(monitor); ) :
+  c == 11 ? sec_halve(a) :
+  c == 12 ? sec_double(a) :
+  c == 13 ? set_vol(a, v) :
+  c == 14 ? set_pan(a, v) :
+  c == 15 ? ( SMUTE[a] = !SMUTE[a]; ) :
+  c == 16 ? undo_toggle() :
+  c == 18 ? hold_cue(a) :
+  c == 19 ? set_cue(a, !CUEF[a]) :
+  c == 20 ? fade_run(floor(a / 2), a % 2) :
+  c == 21 ? fade_sec(a, floor(v / 2), v % 2) :
+  c == 22 ? tap_now(a) :
+  c == 23 ? set_looper_filter(a) :
+  c == 24 ? set_looper_eq(a % 3, floor(a / 3)) :
+  c == 25 ? set_sec_filter(a, v) :
+  c == 26 ? set_sec_eq(a, v % 3, floor(v / 3)) :
+  c == 27 ? fx_reset(raw) :
+  c == 28 ? sched_sec(a, v % 8, floor(v / 8) / 2) :
+  c == 30 ? sec_set_beats(a, v / 2) :
+  c == 17 ? ( a >= 1 && floor(a / 2 * spb + 0.5) <= MAXLEN ? set_beats(a / 2); );
+  extra_grace = 0;
+);
+
+@slider
+loop_gain = 10 ^ (loop_db / 20);
+
+@block
+smp_i = 0;
+loop_gain = 10 ^ (loop_db / 20);
+running = (play_state & 1) ? 1 : 0;       // 1 = playing, 5 = recording
+update_len();
+
+running ? (
+  pos = timeline_pos(cur_beats(), len);
+  s = 0;
+  loop(NSEC,
+    SLEN[s] > 0 ? SPOS[s] = timeline_pos_ph(SBEATS[s], SLEN[s], SPHB[s]);
+    s += 1;
+  );
+);
+
+cue_rec = 0;
+s = 0; loop(NSEC, STATE[s] >= 3 && CUEF[s] ? cue_rec = 1; s += 1; );
+
+grace_spls = floor(grace_ms * 0.001 * srate);
+fade_k = 1 - exp(-1 / (srate * 0.004));
+
+// undo / redo: swap the kept audio with the section, 65536 frames per block
+undo_swap_step(65536);
+
+// clicks in the plugin window
+ui_cmd ? ( handle(ui_cmd, ui_arg); ui_cmd = 0; );
+
+looper_id >= 1 ? (
+  GB = (looper_id|0) * 1024;
+
+  // commands from the bridge
+  widx = gmem[GB + 512];
+  last_id != looper_id || widx < ridx ? ( ridx = widx; last_id = looper_id; );
+  while (ridx < widx) (
+    k = (ridx % 64) * 4;
+    handle(gmem[GB + 520 + k], gmem[GB + 521 + k]);
+    ridx += 1;
+  );
+
+  // audio transfer for save / load (the bridge talks to one looper at a time)
+  (xr = gmem[XF]) != gmem[XF + 1] && gmem[XF + 3] == looper_id ? (
+    xop = gmem[XF + 2];
+    xs = max(0, min(7, gmem[XF + 4]|0));
+    xoff = max(0, gmem[XF + 5]|0);
+    xn = max(0, min(min(gmem[XF + 6]|0, 16384), MAXLEN - xoff));
+    xl = bufl(xs); xrr = bufr(xs);
+    xop == 1 ? (
+      k = 0; loop(xn, gmem[XF + 32 + 2*k] = xl[xoff + k]; gmem[XF + 33 + 2*k] = xrr[xoff + k]; k += 1; );
+    ) : xop == 2 ? (
+      k = 0; loop(xn, xl[xoff + k] = gmem[XF + 32 + 2*k]; xrr[xoff + k] = gmem[XF + 33 + 2*k]; k += 1; );
+    ) : xop == 3 ? (
+      SBEATS[xs] = max(0.5, gmem[XF + 7]);
+      CBEATS[xs] = max(SBEATS[xs], gmem[XF + 8]);
+      SVOL[xs] = gmem[XF + 9]; SPAN[xs] = gmem[XF + 10]; SMUTE[xs] = gmem[XF + 11];
+      CUEF[xs] = gmem[XF + 21] ? 1 : 0;
+      SPHB[xs] = gmem[XF + 24];
+      VALID[xs] = 1; STATE[xs] = 1; FRESH[xs] = 0; PEND[xs] = 0; GPP[xs] = -1;
+      undo_invalidate(xs);
+      update_len();
+    ) : xop == 4 ? (
+      gmem[XF + 12] = VALID[xs];
+      gmem[XF + 13] = SBEATS[xs];
+      gmem[XF + 14] = CBEATS[xs];
+      gmem[XF + 15] = VALID[xs] > 0 ? min(floor(max(CBEATS[xs], SBEATS[xs]) * spb + 0.5), MAXLEN) : 0;
+      gmem[XF + 16] = SVOL[xs]; gmem[XF + 17] = SPAN[xs]; gmem[XF + 18] = SMUTE[xs];
+      gmem[XF + 19] = srate;
+      gmem[XF + 22] = CUEF[xs];
+      gmem[XF + 23] = SPHB[xs];
+    ) : xop == 5 ? (
+      clear_sec(xs);
+    );
+    gmem[XF + 1] = xr;
+  );
+
+  // publish state
+  gmem[GB] = (gmem[GB] + 1) % 1000000;
+  gmem[GB + 1] = cur_beats();
+  gmem[GB + 2] = quant_mode;
+  gmem[GB + 3] = len > 0 ? pos / len : 0;
+  gmem[GB + 4] = running;
+  gmem[GB + 5] = ts_num;
+  gmem[GB + 6] = len / srate;
+  gmem[GB + 7] = monitor;
+  gmem[GB + 8] = floor(cur_beats() * 2 * spb + 0.5) <= MAXLEN;
+  gmem[GB + 9] = ts_denom;
+  gmem[GB + 10] = MAXLEN / srate;
+  gmem[GB + 11] = 10;                      // protocol version (bridge/UI check it)
+  gmem[GB + 12] = usec;
+  gmem[GB + 13] = usec >= 0 ? (ustate == 2 ? 2 : 1) : 0;
+  s = 0;
+  loop(NSEC,
+    k = GB + 16 + s * 12;
+    gmem[k] = STATE[s];
+    gmem[k + 1] = PEND[s];
+    gmem[k + 2] = VALID[s] > 0;
+    gmem[k + 3] = LVL[s];
+    gmem[k + 4] = SLEN[s] > 0 ? SPOS[s] / SLEN[s] : 0;
+    gmem[k + 5] = SBEATS[s];
+    gmem[k + 6] = SLEN[s] / srate;
+    gmem[k + 7] = SVOL[s];
+    gmem[k + 8] = SPAN[s];
+    gmem[k + 9] = SMUTE[s];
+    gmem[k + 10] = CUEF[s];
+    s += 1;
+  );
+);
+s = 0; loop(NSEC, LVL[s] *= 0.85; s += 1; );
+
+// fade of the whole looper: the gain follows the bars left. A fade out ends with
+// everything in pause, a fade in simply arrives at full volume.
+fd_on && running ? (
+  fr = (fd_b1 - beat_position) / max(fd_b1 - fd_b0, 0.001);
+  fd_on == 1 ? (
+    fr <= 0 ? ( fd_tgt = 0; fade_end(); ) : ( fd_tgt = min(1, fr); );
+  ) : (
+    fr <= 0 ? ( fd_tgt = 1; fd_on = 0; fd_bars = 0; ) : ( fd_tgt = min(1, 1 - fr); );
+  );
+) : (
+  fd_on ? ( fd_on = 0; fd_bars = 0; );      // transport stopped: the fade is off
+  fd_tgt = 1;
+);
+fd_step = (fd_tgt - fd_g) / max(samplesblock, 1);
+
+// booked actions: fire the ones whose beat has arrived
+running ? (
+  s = 0;
+  loop(NSEC,
+    SCHA[s] && beat_position >= SCHB[s] ? (
+      sch_d = floor((beat_position - SCHB[s]) * 60 / tempo * srate + 0.5);
+      sch_a = SCHA[s];
+      SCHA[s] = 0;
+      PEND[s] = 0;
+      sch_a == 4 ? ( STATE[s] < 2 ? ( CUEF[s] = 1; RECPAUSE[s] = 1; ); );
+      // A new take starts exactly on the booked beat and remembers it as the start
+      // of its loop (SPHB), so nothing is rotated. On a section that is already
+      // looping, the late-press correction only makes sense right after its own
+      // loop start: anywhere else it would touch the wrong cells, so d = 0.
+      sch_new = (sch_a == 3 || sch_a == 4) && STATE[s] <= 1;
+      sch_dd = sch_new ? sch_d : (SPOS[s] < sch_d ? SPOS[s] : 0);
+      sch_a == 3 || sch_a == 4 ? exec(s, 3, sch_dd) :
+      sch_a == 2 ? exec(s, 2, sch_dd) :
+      sch_a == 1 ? exec(s, 1, sch_dd);
+    );
+    s += 1;
+  );
+);
+
+// the same, section by section
+s = 0;
+loop(NSEC,
+  SFON[s] && running ? (
+    fr = (SFB1[s] - beat_position) / max(SFB1[s] - SFB0[s], 0.001);
+    SFON[s] == 1 ? (
+      fr <= 0 ? ( sf_t = 0; exec(s, 1, 0); SFON[s] = 0; ) : ( sf_t = min(1, fr); );
+    ) : (
+      fr <= 0 ? ( sf_t = 1; SFON[s] = 0; ) : ( sf_t = min(1, 1 - fr); );
+    );
+  ) : (
+    SFON[s] ? SFON[s] = 0;
+    sf_t = 1;
+  );
+  SFST[s] = (sf_t - SFG[s]) / max(samplesblock, 1);
+  s += 1;
+);
+
+// filter / EQ: the values are smoothed per block, so a knob never clicks
+eq_a1 = 1 - exp(-2 * $pi * 250 / srate);     // low band  < 250 Hz
+eq_a2 = 1 - exp(-2 * $pi * 3000 / srate);    // high band > 3 kHz
+fx_r2 = 2 * 0.62;                            // a little resonance, DJ flavour
+s = 0;
+loop(NSEC,
+  SFILC[s] += (SFIL[s] - SFILC[s]) * 0.3;
+  SEQLC[s] += (SEQL[s] - SEQLC[s]) * 0.3;
+  SEQMC[s] += (SEQM[s] - SEQMC[s]) * 0.3;
+  SEQHC[s] += (SEQH[s] - SEQHC[s]) * 0.3;
+  abs(SFILC[s] - SFIL[s]) < 0.0005 ? SFILC[s] = SFIL[s];
+  abs(SEQLC[s] - SEQL[s]) < 0.0005 ? SEQLC[s] = SEQL[s];
+  abs(SEQMC[s] - SEQM[s]) < 0.0005 ? SEQMC[s] = SEQM[s];
+  abs(SEQHC[s] - SEQH[s]) < 0.0005 ? SEQHC[s] = SEQH[s];
+  SFXON[s] = SFILC[s] != 0 || SEQLC[s] != 1 || SEQMC[s] != 1 || SEQHC[s] != 1;
+  SFXON[s] ? (
+    SFMODE[s] = SFILC[s] < -0.001 ? -1 : (SFILC[s] > 0.001 ? 1 : 0);
+    SFMODE[s] ? SFC[s] = fx_coef(SFILC[s]);
+  );
+  s += 1;
+);
+lfilc += (lfil - lfilc) * 0.3;
+leqlc += (leql - leqlc) * 0.3;
+leqmc += (leqm - leqmc) * 0.3;
+leqhc += (leqh - leqhc) * 0.3;
+abs(lfilc - lfil) < 0.0005 ? lfilc = lfil;
+abs(leqlc - leql) < 0.0005 ? leqlc = leql;
+abs(leqmc - leqm) < 0.0005 ? leqmc = leqm;
+abs(leqhc - leqh) < 0.0005 ? leqhc = leqh;
+lfxon = lfilc != 0 || leqlc != 1 || leqmc != 1 || leqhc != 1;
+lfxon ? (
+  lfmode = lfilc < -0.001 ? -1 : (lfilc > 0.001 ? 1 : 0);
+  lfmode ? lfc = fx_coef(lfilc);
+);
+looper_id >= 1 ? (
+  gmem[GB + 14] = fd_g;
+  gmem[GB + 15] = fd_on ? fd_bars : 0;
+  gmem[GB + 112] = lfil;
+  gmem[GB + 113] = leql;
+  gmem[GB + 114] = leqm;
+  gmem[GB + 115] = leqh;
+  gmem[GB + 116] = fd_on;
+  s = 0;
+  loop(NSEC,
+    k = GB + 120 + s * 6;
+    gmem[k] = SFIL[s];
+    gmem[k + 1] = SEQL[s];
+    gmem[k + 2] = SEQM[s];
+    gmem[k + 3] = SEQH[s];
+    gmem[k + 4] = SFG[s];
+    gmem[k + 5] = SFON[s];
+    s += 1;
+  );
+);
+
+@sample
+inL = spl0;
+inR = spl1;
+oL = oR = 0;      // main bus
+cL = cR = 0;      // cue bus (in-ears only)
+
+running ? (
+  s = 0;
+  bl = BUF0;
+  loop(NSEC,
+    // quantized action waiting for the end of its loop?
+    (a = PEND[s]) ? (
+      gp = grid_pos(s, a);
+      gl = grid_len(s, a);
+      (GPP[s] < 0 && gp < grace_spls) || (GPP[s] >= 0 && gp < GPP[s] - gl * 0.5) ? (
+        exec(s, a, gp);
+      ) : (
+        GPP[s] = gp;
+      );
+    );
+
+    br = bl + MAXLEN;
+    st = STATE[s];
+    g = GAIN[s];
+    g += ((st >= 2 && !SMUTE[s] && !(s == usec && uswap >= 0)) - g) * fade_k;
+    GAIN[s] = g;
+    SFG[s] = max(0, min(1, SFG[s] + SFST[s]));   // fade of this section
+    // volume + pan (balance), smoothed
+    v = SVOL[s];
+    CGL[s] += (v * (SPAN[s] > 0 ? 1 - SPAN[s] : 1) - CGL[s]) * fade_k;
+    CGR[s] += (v * (SPAN[s] < 0 ? 1 + SPAN[s] : 1) - CGR[s]) * fade_k;
+    (n = SLEN[s]) > 0 ? (
+      p = SPOS[s];
+      // undo: keep the old audio of a cell before the rec changes it
+      st >= 3 && s == usec && ufresh > 0 && p < ulen ? ( UBL[p] = bl[p]; UBR[p] = br[p]; ufresh -= 1; );
+      st >= 2 && FRESH[s] > 0 ? ( bl[p] = 0; br[p] = 0; FRESH[s] -= 1; );
+      g > 0.00001 ? (
+        l = bl[p] * g * CGL[s] * SFG[s];
+        r = br[p] * g * CGR[s] * SFG[s];
+        SFXON[s] ? (
+          l = fx_run(l, s * 2, SFMODE[s], SFC[s], SEQLC[s], SEQMC[s], SEQHC[s]);
+          r = fx_run(r, s * 2 + 1, SFMODE[s], SFC[s], SEQLC[s], SEQMC[s], SEQHC[s]);
+        );
+        CUEF[s] ? ( cL += l; cR += r; ) : ( oL += l; oR += r; );
+        LVL[s] = max(LVL[s], max(abs(l), abs(r)));
+      );
+      st >= 3 ? ( bl[p] += inL; br[p] += inR; );
+      (p += 1) >= n ? p = 0;
+      SPOS[s] = p;
+    );
+    bl += 2 * MAXLEN;
+    s += 1;
+  );
+  (pos += 1) >= len ? pos = 0;
+) : (
+  memset(GPP, -1, NSEC);
+);
+
+PRL[pr_w] = inL;
+PRR[pr_w] = inR;
+(pr_w += 1) >= PR_LEN ? pr_w = 0;
+
+// filter / EQ of the whole looper, on the main bus
+lfxon ? (
+  oL = fx_run(oL, 16, lfmode, lfc, leqlc, leqmc, leqhc);
+  oR = fx_run(oR, 17, lfmode, lfc, leqlc, leqmc, leqhc);
+);
+
+// fade: ramps to the block's target, so the curve is smooth sample by sample
+fd_g = max(0, min(1, fd_g + fd_step));
+ogain = loop_gain * fd_g;
+
+// while a silent rec runs, what you play goes to the cue bus, not to the main
+spl0 = inL * monitor * (!cue_rec) + oL * ogain;
+spl1 = inR * monitor * (!cue_rec) + oR * ogain;
+spl2 = inL * monitor * cue_rec + cL * ogain;
+spl3 = inR * monitor * cue_rec + cR * ogain;
+smp_i += 1;
+
+@gfx 560 170
+function set_state_color(st, a)
+(
+  st == 0 ? gfx_set(0.22, 0.22, 0.24, a) :
+  st == 1 ? gfx_set(0.30, 0.36, 0.55, a) :
+  st == 2 ? gfx_set(0.13, 0.77, 0.37, a) :
+  st == 3 ? gfx_set(0.94, 0.27, 0.27, a) :
+            gfx_set(0.96, 0.62, 0.04, a);
+);
+
+// NB: only gfx-private variable names here (the audio thread uses s, k, b...)
+gfx_set(0.08, 0.08, 0.09);
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+gfx_set(0.85);
+gfx_x = 8; gfx_y = 8;
+gv_b = cur_beats();
+gfx_printf("MyLooper  ID %d   %s   rec: ", looper_id|0, quant_mode ? "BAR" : "IMMEDIATE");
+(gv_b / ts_num) == floor(gv_b / ts_num) ? gfx_printf("%d bar", gv_b / ts_num) :
+  gv_b == floor(gv_b) ? gfx_printf("%d beat", gv_b) : gfx_printf("%.1f beat", gv_b);
+running ? 0 : gfx_drawstr("   (transport stopped)");
+
+// rec-length grid position
+gfx_set(0.2); gfx_rect(8, 26, gfx_w - 16, 6);
+gfx_set(0.4, 0.6, 1);
+len > 0 ? gfx_rect(8, 26, (gfx_w - 16) * pos / len, 6);
+
+gv_w = (gfx_w - 16) / NSEC;
+gv_blink = (time_precise() * 4) & 1;
+gv_s = 0;
+loop(NSEC,
+  gv_x = 8 + gv_s * gv_w;
+  gv_y = 42;
+  gv_h = gfx_h - 50;
+  set_state_color(STATE[gv_s] == 0 && VALID[gv_s] > 0 ? 1 : STATE[gv_s], 1);
+  gfx_rect(gv_x + 3, gv_y, gv_w - 6, gv_h);
+  // own loop position
+  SLEN[gv_s] > 0 ? (
+    gfx_set(1, 1, 1, 0.35);
+    gfx_rect(gv_x + 3, gv_y + gv_h - 4, (gv_w - 6) * SPOS[gv_s] / SLEN[gv_s], 4);
+  );
+  PEND[gv_s] && gv_blink ? (
+    set_state_color(PEND[gv_s], 1);
+    gfx_rect(gv_x + 3, gv_y, gv_w - 6, 5);
+    gfx_rect(gv_x + 3, gv_y + gv_h - 5, gv_w - 6, 5);
+  );
+  gfx_set(1);
+  gfx_x = gv_x + 9; gfx_y = gv_y + 6;
+  gfx_printf("%d", gv_s + 1);
+  SBEATS[gv_s] > 0 ? (
+    gfx_x = gv_x + 9; gfx_y = gv_y + 22;
+    gfx_set(1, 1, 1, 0.6);
+    SBEATS[gv_s] == floor(SBEATS[gv_s]) ? gfx_printf("%d beat", SBEATS[gv_s]) : gfx_printf("%.1f beat", SBEATS[gv_s]);
+  );
+  gfx_set(1);
+  gfx_x = gv_x + 9; gfx_y = gv_y + gv_h - 20;
+  gfx_drawstr(STATE[gv_s] == 2 ? "PLAY" : STATE[gv_s] == 3 ? "REC" : STATE[gv_s] == 4 ? "ODUB" :
+              VALID[gv_s] > 0 ? "STOP" : "-");
+  CUEF[gv_s] ? (
+    gfx_set(0.45, 0.65, 1);
+    gfx_x = gv_x + 9; gfx_y = gv_y + gv_h - 32;
+    gfx_drawstr("CUE");
+  );
+
+  mouse_x >= gv_x && mouse_x < gv_x + gv_w && mouse_y >= gv_y && mouse_y < gv_y + gv_h ? (
+    (mouse_cap & 1) && !(gv_last_cap & 1) ? ( ui_arg = gv_s; ui_cmd = 1; );
+    (mouse_cap & 2) && !(gv_last_cap & 2) ? ( ui_arg = gv_s; ui_cmd = 2; );
+  );
+  gv_s += 1;
+);
+gv_last_cap = mouse_cap;
