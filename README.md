@@ -15,6 +15,7 @@ Non serve nessun server esterno: la pagina la serve REAPER, lo script Lua fa da 
 |---|---|
 | `reaper/MyLooper.jsfx` | Il motore: 8 sezioni stereo per traccia, modalità Normale/Bar, ½ e ×2 |
 | `reaper/MyLooper_bridge.lua` | Il ponte tra iPad e JSFX (assegna gli ID, gira comandi e stato) |
+| `reaper/MyLooper_gate.jsfx` | Il gate per gli stacchi sulla drum machine (lo script lo mette da solo sulle sue tracce) |
 | `reaper/looper.html` | L'interfaccia già compilata (un solo file) |
 | `src/` | Sorgente React dell'interfaccia |
 
@@ -107,7 +108,31 @@ Non serve nessun server esterno: la pagina la serve REAPER, lo script Lua fa da 
   - **8 slot** salvati nella cartella del progetto (`MyLooper/scalette/`), con nome e numero di eventi.
   - rec, play e pausa non le manda lo script: le **prenota nel JSFX con il beat esatto**, quindi cadono sul campione
     giusto come se le premessi tu (la correzione del ritardo recupera anche il pre-roll della rec).
+  - **stacco**: silenzio dentro la bar. Scegli **da dove** (gli ottavi della bar: 1, e, 2, e…) e **quanto dura**
+    (1/8 … 7/8, 1 o 2 bar). Sotto la musica continua a girare, quindi quando lo stacco finisce tutto riparte
+    esattamente a tempo, senza toccare play/pausa. Sulla riga di una sezione tace quella sezione, sulla riga
+    *tutto* di uno strumento tace lo strumento, su *Generale* tacciono tutti i looper e (con la spunta) anche la
+    drum machine. È prenotato nel JSFX al campione, con una rampa di 4 ms per non fare click. Per la drum serve
+    `MyLooper_gate.jsfx` sulle sue tracce: lo script lo aggiunge da solo alla prima scaletta che ne ha bisogno.
+  - **pattern drum** (su *Generale*): manda alla UNO Drum il cambio di pattern (SysEx sulla sua uscita MIDI,
+    `F0 00 21 1A 02 02 35 00 <n> F7`). Nel riquadro *Drum machine* sotto la griglia puoi provare un pattern al volo,
+    correggere la numerazione se arriva a quello dopo, e scegliere se mandare il cambio sulla stanghetta o un po'
+    prima (se la UNO aspetta la fine del suo pattern prima di cambiare).
+  - **filtro / bassi / medi / alti** con **transizione**: dopo il valore scegli *Subito* oppure *in ½ … 32 bar*,
+    e la manopola ci arriva gradualmente partendo dalla bar dell'evento (la fa il JSFX, a tempo). Su *Generale* vale
+    per tutti gli strumenti. Se tocchi quella manopola a mano la transizione si ferma.
+  - **suono synth** (su *Generale*): alla bar scelta la traccia *synth* passa a un altro suono di Splice INSTRUMENT
+    (o LABS). I suoni sono preset di REAPER del plugin: nel riquadro *Synth* sotto la griglia scegli uno strumento in
+    Splice e tocchi **Salva il suono attuale** (il nome lo prende dallo strumento), poi lo trovi nell'elenco della
+    scaletta. Da lì puoi anche caricarli a mano o toglierli. Cambia solo il plugin: il looper sulla stessa traccia non
+    si tocca. Il cambio carica dei campioni, quindi mettilo dove il synth non suona.
   - mentre gira puoi sempre intervenire a mano con i pulsanti: la scaletta non blocca niente.
+- **Drum a tempo**: se REAPER ha un buco audio la drum machine può perdere dei tick del MIDI clock e finire fuori
+  dalla bar. *Tieni premuto Drum* (o *Rimettila a tempo* nel riquadro Drum machine della scaletta): alla prossima
+  bar utile `MyLooper_gate.jsfx` manda alla UNO Stop + Start mezzo tick prima della stanghetta, così riparte il
+  pattern esattamente sull'1. La bar utile è un multiplo della lunghezza del pattern (1/2/4/8 bar, contate dall'inizio
+  del progetto). Di default lo fa **da solo** dopo ogni buco audio che REAPER segnala. Lo script mette il gate sulle
+  tracce drum e manda l'uscita MIDI della prima traccia drum alla UNO (solo se non ne aveva già una).
 - **Memorie** (nell'header): 8 slot che salvano tutti i looper nella cartella del progetto
   (`MyLooper/memN/`, un WAV float per sezione più `mem.txt` con lunghezze, volume, pan e mute).
   Per caricare tieni premuto *Carica*: svuota i looper coinvolti, riporta il tempo a quello salvato e lascia

@@ -20,13 +20,17 @@ local EXT           = "MyLooper"   -- ExtState section (must match the web app)
 local MAX_LOOPERS   = 16
 local AUTO_TRANSPORT = true        -- start REAPER playback when a rec/play command arrives
 local SCAN_EVERY    = 1.0          -- seconds between track scans
-local PROTO         = 10            -- must match MyLooper.jsfx (gmem +11) and the web app
+local PROTO         = 12            -- must match MyLooper.jsfx (gmem +11) and the web app
 
 -- Drum machine: the "Drum" button on the iPad mutes / unmutes these tracks at the end of
 -- the bar, so the machine keeps running on the MIDI clock and comes back perfectly in sync.
 local DRUM_NAME     = "drum"       -- any track whose name contains this (case insensitive)
 local DRUM_TRACKS   = { 4, 5 }     -- fallback if no track name matches: track numbers (1-based)
 local DRUM_GRACE    = 0.15         -- as in the JSFX: a press just after the bar line still counts
+-- Pattern changes go to the drum machine as SysEx on its MIDI output (IK UNO Drum:
+-- F0 00 21 1A 02 02 35 00 <pattern> F7, the same port REAPER already sends the clock to)
+local UNO_NAME      = "uno"        -- MIDI output whose name contains this (case insensitive)
+local GATE_FX       = { "JS:MyLooper/MyLooper_gate.jsfx", "JS:MyLooper/MyLooper_gate", "MyLooper Gate" }
 
 reaper.gmem_attach(NS)
 
@@ -66,7 +70,9 @@ local function scan()
     local tr = reaper.GetTrack(0, t)
     for f = 0, reaper.TrackFX_GetCount(tr) - 1 do
       local _, fxname = reaper.TrackFX_GetFXName(tr, f, "")
-      if fxname:find("MyLooper", 1, true) and #list < MAX_LOOPERS then
+      local low = fxname:lower()
+      local isGate = low:find("mylooper gate", 1, true) or low:find("mylooper_gate", 1, true)
+      if fxname:find("MyLooper", 1, true) and not isGate and #list < MAX_LOOPERS then
         list[#list + 1] = { track = tr, fx = f }
         break -- one looper per track
       end
@@ -159,6 +165,413 @@ local function runDrums()
   if not isPlaying() then setDrums(drums.want) return end
   local m = measureAt(reaper.GetPlayPosition())
   if m >= (drums.target or m) then setDrums(drums.want) end
+end
+
+---------------------------------------------------------------- drum machine: pattern
+-- Settings from the iPad, kept by REAPER between sessions:
+--   uno_ofs  0 = byte sent = pattern number, 1 = pattern number - 1
+--   uno_lead how early the change is sent, in eighths (0 = on the bar line): useful if
+--            the machine waits for the end of its pattern before switching
+local uno = { dev = -1, name = "", last = 0, sent = 0, err = "" }
+
+local function unoSetting(key, def)
+  local v = tonumber(reaper.GetExtState(EXT, key))
+  return v or def
+end
+
+local function scanUno()
+  uno.dev, uno.name = -1, ""
+  if not reaper.GetNumMIDIOutputs then return end
+  for i = 0, reaper.GetNumMIDIOutputs() - 1 do
+    local ok, name = reaper.GetMIDIOutputName(i, "")
+    if ok and name and name:lower():find(UNO_NAME, 1, true) then
+      uno.dev, uno.name = i, name
+      return
+    end
+  end
+end
+
+local function sendPattern(n)
+  n = math.floor(n or 0)
+  if n < 1 or n > 100 then return end
+  if not reaper.SendMIDIMessageToHardware then uno.err = "REAPER troppo vecchio (manca SendMIDIMessageToHardware)" return end
+  if uno.dev < 0 then scanUno() end
+  if uno.dev < 0 then uno.err = "UNO Drum non trovata tra le uscite MIDI" return end
+  local b = n - unoSetting("uno_ofs", 0)
+  b = math.max(0, math.min(127, b))
+  reaper.SendMIDIMessageToHardware(uno.dev, string.char(0xF0, 0x00, 0x21, 0x1A, 0x02, 0x02, 0x35, 0x00, b, 0xF7))
+  uno.last, uno.sent, uno.err = n, uno.sent + 1, ""
+end
+
+---------------------------------------------------------------- drum machine: stacchi
+-- A stacco on the drum needs to be sample accurate, so it is done by MyLooper_gate.jsfx
+-- on the drum tracks (the bridge muting the tracks would be ~30 ms late). The gate reads
+-- up to 4 windows from gmem 66..73 and beats 64.
+local GATE = 64
+local gateSeen = { hb = -1, time = -100 }
+
+local function gateAlive(now)
+  local hb = reaper.gmem_read(GATE)
+  if hb ~= gateSeen.hb then gateSeen.hb, gateSeen.time = hb, now end
+  return now - gateSeen.time < 1.0
+end
+
+local function hasGate(tr)
+  for f = 0, reaper.TrackFX_GetCount(tr) - 1 do
+    local _, n = reaper.TrackFX_GetFXName(tr, f, "")
+    n = n:lower()
+    if n:find("mylooper gate", 1, true) or n:find("mylooper_gate", 1, true) then return true end
+  end
+  return false
+end
+
+local function ensureGate()
+  if not reaper.TrackFX_AddByName then return end
+  for _, tr in ipairs(drums.tracks) do
+    if not hasGate(tr) then
+      for _, name in ipairs(GATE_FX) do
+        if reaper.TrackFX_AddByName(tr, name, false, -1) >= 0 then break end   -- -1 = add a new one
+      end
+    end
+  end
+end
+
+local function gateWindow(a, b)
+  local now = 0
+  local _, _, _, fb = reaper.TimeMap2_timeToBeats(0, reaper.GetPlayPosition())
+  now = fb or 0
+  local best, bestEnd = 0, math.huge
+  for k = 0, 3 do
+    local e = reaper.gmem_read(GATE + 3 + 2 * k)
+    if e <= now then best = k break end                     -- free
+    if e < bestEnd then best, bestEnd = k, e end            -- all busy: the one ending first
+  end
+  reaper.gmem_write(GATE + 3 + 2 * best, 0)                 -- end last: never half written
+  reaper.gmem_write(GATE + 2 + 2 * best, a)
+  reaper.gmem_write(GATE + 3 + 2 * best, b)
+end
+
+local function gateClear()
+  for k = 0, 3 do reaper.gmem_write(GATE + 3 + 2 * k, 0) end
+end
+
+---------------------------------------------------------------- drum machine: resync
+-- If REAPER hiccups (an audio dropout), the machine can lose MIDI clock ticks and end up
+-- off the bar. A resync sends Stop + Start to it half a clock tick before a bar line
+-- (MyLooper_gate.jsfx does it, sample accurate, through the MIDI output of the first drum
+-- track), so it restarts its pattern exactly on the 1. On a multiple of the pattern length,
+-- counted from the start of the project. Automatic after every dropout REAPER reports,
+-- or by hand (long press on Drum).
+--   drum_sync_auto  1 = after a dropout (default), 0 = only by hand
+--   drum_patlen     length of the machine's pattern in bars (1, 2, 4, 8)
+local sync = { beat = 0, bar = 0, seq = 0, n = 0, miss = 0, xruns = 0, lastX = nil, prepared = {} }
+
+local function syncSetting(key, def)
+  local v = tonumber(reaper.GetExtState(EXT, key))
+  return v or def
+end
+
+-- gate on the drum tracks + MIDI output of the first one to the machine (only if it had none)
+local function prepareDrumSync(force)
+  local tr = drums.tracks[1]
+  if not tr then return end
+  local key = tostring(tr)
+  if sync.prepared[key] and not force then return end
+  sync.prepared[key] = true
+  ensureGate()
+  if uno.dev < 0 then scanUno() end
+  if uno.dev >= 0 and reaper.GetMediaTrackInfo_Value(tr, "I_MIDIHWOUT") < 0 then
+    reaper.SetMediaTrackInfo_Value(tr, "I_MIDIHWOUT", uno.dev * 32)   -- device, all channels
+  end
+end
+
+local function midiOutOk()
+  local tr = drums.tracks[1]
+  return tr and reaper.GetMediaTrackInfo_Value(tr, "I_MIDIHWOUT") >= 0
+end
+
+local function requestResync()
+  if #drums.tracks == 0 or not isPlaying() then return end
+  prepareDrumSync(true)
+  local len = math.max(1, math.floor(syncSetting("drum_patlen", 1)))
+  local pos = reaper.GetPlayPosition()
+  local _, measures = reaper.TimeMap2_timeToBeats(0, pos)
+  local _, _, cml, nowFull = reaper.TimeMap2_timeToBeats(0, pos)
+  local barLen = (cml and cml > 0) and cml or 4
+  local m = measures + 1
+  for _ = 1, 64 do
+    local t = reaper.TimeMap2_beatsToTime(0, 0, m)
+    local _, _, _, fb = reaper.TimeMap2_timeToBeats(0, t)
+    if m % len == 0 and fb - nowFull >= barLen * 0.25 then
+      sync.seq = (math.floor(reaper.time_precise() * 1000) % 1000000) + 1
+      sync.beat, sync.bar = fb, m + 1
+      reaper.gmem_write(GATE + 10, 0)
+      reaper.gmem_write(GATE + 11, sync.seq)
+      reaper.gmem_write(GATE + 10, fb)      -- beat last: never half written
+      return
+    end
+    m = m + 1
+  end
+end
+
+local function runSync()
+  -- a dropout reported by REAPER? (audio or media xrun)
+  if reaper.GetUnderrunTime then
+    local a, md = reaper.GetUnderrunTime()
+    local key = tostring(a) .. ":" .. tostring(md)
+    if sync.lastX and key ~= sync.lastX and isPlaying() then
+      sync.xruns = sync.xruns + 1
+      if syncSetting("drum_sync_auto", 1) == 1 and sync.beat == 0 and drums.mute == 0 then requestResync() end
+    end
+    sync.lastX = key
+  end
+  if sync.beat > 0 then
+    local _, _, _, fb = reaper.TimeMap2_timeToBeats(0, reaper.GetPlayPosition())
+    if not isPlaying() then
+      sync.beat, sync.bar = 0, 0
+      reaper.gmem_write(GATE + 10, 0)
+    elseif (fb or 0) > sync.beat + 0.5 then
+      if reaper.gmem_read(GATE + 12) == sync.seq then sync.n = sync.n + 1 else sync.miss = sync.miss + 1 end
+      sync.beat, sync.bar = 0, 0
+      reaper.gmem_write(GATE + 10, 0)
+    end
+  end
+end
+
+---------------------------------------------------------------- synth: sounds
+-- The sounds of the synth (Splice INSTRUMENT / LABS) are REAPER presets of the plugin:
+-- "Salva suono" on the iPad copies the current state of the plugin into REAPER's preset
+-- file (the same format REAPER writes: hex of the state + 1 byte checksum = sum of the
+-- bytes), with the instrument name read from the state itself. Changing sound is then
+-- TrackFX_SetPreset: only that plugin changes, the looper on the same track is untouched.
+-- Every sound gets a stable id (kept in Scripts/MyLooper/suoni.txt), used by the scaletta.
+local SYNTH_TRACK   = "synth"      -- track whose name contains this (case insensitive)
+local SYNTH_FX      = { "splice instrument", "labs" }   -- which plugin on it, in this order
+
+local synth = { track = nil, fx = -1, fxname = "", file = "", list = {}, cur = "", msg = "",
+                listAt = -100, ids = nil }
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local B64I = {}
+for i = 1, 64 do B64I[B64:byte(i)] = i - 1 end
+local function b64decode(s)
+  local out, n, bits = {}, 0, 0
+  for i = 1, #s do
+    local v = B64I[s:byte(i)]
+    if v then
+      bits = bits * 64 + v
+      n = n + 6
+      if n >= 8 then
+        n = n - 8
+        local b = math.floor(bits / 2 ^ n) % 256
+        out[#out + 1] = string.char(b)
+        bits = bits % (2 ^ n)
+      end
+    end
+  end
+  return table.concat(out)
+end
+
+local function presetFileFor(fxname)
+  -- "VST3i: Splice INSTRUMENT (Splice)" -> presets/vst3-Splice INSTRUMENT.ini
+  local kind, rest = fxname:match("^(%w+)i?:%s*(.-)$")
+  if not kind then return "" end
+  kind = kind:lower():gsub("i$", "")
+  rest = rest:gsub("%s*%b()%s*$", "")
+  return reaper.GetResourcePath() .. "/presets/" .. kind .. "-" .. rest .. ".ini"
+end
+
+local function scanSynth()
+  synth.track, synth.fx = nil, -1
+  for t = 0, reaper.CountTracks(0) - 1 do
+    local tr = reaper.GetTrack(0, t)
+    local _, name = reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", "", false)
+    if name:lower():find(SYNTH_TRACK, 1, true) then
+      for _, want in ipairs(SYNTH_FX) do
+        for f = 0, reaper.TrackFX_GetCount(tr) - 1 do
+          local _, fxn = reaper.TrackFX_GetFXName(tr, f, "")
+          if fxn:lower():find(want, 1, true) then
+            synth.track, synth.fx, synth.fxname = tr, f, fxn
+            synth.file = presetFileFor(fxn)
+            return
+          end
+        end
+      end
+    end
+  end
+end
+
+-- the preset file: { general = {lines}, presets = { {name, data, len} } }
+local function readPresets(path)
+  local pf = { general = {}, presets = {} }
+  local f = io.open(path, "rb")
+  if not f then return pf end
+  local cur = nil
+  for line in f:lines() do
+    line = line:gsub("\r$", "")
+    local sec = line:match("^%[(.-)%]$")
+    if sec then
+      if sec:match("^Preset%d+$") then cur = {}; pf.presets[#pf.presets + 1] = cur else cur = nil end
+    elseif line ~= "" then
+      local k, v = line:match("^([^=]+)=(.*)$")
+      if k then
+        if cur then cur[k] = v
+        elseif k ~= "NbPresets" then pf.general[#pf.general + 1] = line end
+      end
+    end
+  end
+  f:close()
+  return pf
+end
+
+local function writePresets(path, pf)
+  local out = { "[General]" }
+  for _, l in ipairs(pf.general) do out[#out + 1] = l end
+  out[#out + 1] = "NbPresets=" .. #pf.presets
+  out[#out + 1] = ""
+  for i, p in ipairs(pf.presets) do
+    out[#out + 1] = "[Preset" .. (i - 1) .. "]"
+    for k, v in pairs(p) do
+      if k ~= "Data" and k ~= "Len" and k ~= "Name" then out[#out + 1] = k .. "=" .. v end
+    end
+    out[#out + 1] = "Data=" .. (p.Data or "")
+    out[#out + 1] = "Len=" .. (p.Len or "0")
+    out[#out + 1] = "Name=" .. (p.Name or "")
+    out[#out + 1] = ""
+  end
+  reaper.RecursiveCreateDirectory(reaper.GetResourcePath() .. "/presets", 0)
+  local f = io.open(path, "wb")
+  if not f then return false end
+  f:write(table.concat(out, "\r\n"))
+  f:close()
+  return true
+end
+
+-- stable ids for the scaletta: id|name, one per line
+local function idsPath() return reaper.GetResourcePath() .. "/Scripts/MyLooper/suoni.txt" end
+local function loadIds()
+  synth.ids = { byName = {}, byId = {}, next = 1 }
+  local f = io.open(idsPath(), "r")
+  if not f then return end
+  for line in f:lines() do
+    local id, name = line:match("^(%d+)|(.*)$")
+    if id then
+      id = tonumber(id)
+      synth.ids.byName[name], synth.ids.byId[id] = id, name
+      synth.ids.next = math.max(synth.ids.next, id + 1)
+    end
+  end
+  f:close()
+end
+local function idFor(name)
+  if not synth.ids then loadIds() end
+  local id = synth.ids.byName[name]
+  if id then return id end
+  id = synth.ids.next
+  synth.ids.next = id + 1
+  synth.ids.byName[name], synth.ids.byId[id] = id, name
+  local f = io.open(idsPath(), "a")
+  if f then f:write(id .. "|" .. name .. "\n"); f:close() end
+  return id
+end
+
+local function refreshSynthList(now)
+  synth.listAt = now or 0
+  synth.list = {}
+  if synth.file == "" then return end
+  for _, p in ipairs(readPresets(synth.file).presets) do
+    if p.Name and p.Name ~= "" then synth.list[#synth.list + 1] = { id = idFor(p.Name), name = p.Name } end
+  end
+end
+
+-- the state of the plugin, exactly as it is in the project (= the body of a preset)
+local function synthState()
+  if not synth.track then return nil end
+  local ok, chunk = reaper.GetTrackStateChunk(synth.track, "", false)
+  if not ok then return nil end
+  local idx, inChain, lines, grab = -1, false, {}, false
+  for line in chunk:gmatch("[^\r\n]+") do
+    local t = line:match("^%s*(.-)%s*$")
+    if grab then
+      if t == ">" then break end
+      lines[#lines + 1] = b64decode(t)       -- every line is whole base64 quads
+    elseif t:match("^<FXCHAIN$") or t:match("^<FXCHAIN%s") then inChain = true
+    elseif t:match("^<FXCHAIN_REC") then inChain = false
+    elseif inChain and (t:match("^<VST ") or t:match("^<JS ") or t:match("^<AU ") or t:match("^<CLAP ")
+           or t:match("^<DX ") or t:match("^<LV2 ") or t:match("^<VIDEO_EFFECT")) then
+      idx = idx + 1
+      if idx == synth.fx then grab = true end
+    end
+  end
+  if #lines == 0 then return nil end
+  return table.concat(lines)
+end
+
+local function soundName(state)
+  local family, name = state:match('<META family="([^"]*)" name="([^"]*)"')
+  if name and name ~= "" then
+    return (family and family ~= "") and (name .. " (" .. family .. ")") or name
+  end
+  return "Suono " .. os.date("%d/%m %H.%M")
+end
+
+local function saveSound()
+  scanSynth()
+  if not synth.track then synth.msg = "Non trovo la traccia synth con Splice INSTRUMENT" return end
+  local state = synthState()
+  if not state then synth.msg = "Non riesco a leggere lo stato del synth" return end
+  local name = soundName(state):gsub("[\r\n=%[%]]", " ")
+  local sum = 0
+  for i = 1, #state do sum = sum + state:byte(i) end
+  local hex = (state .. string.char(sum % 256)):gsub(".", function(c) return string.format("%02X", c:byte()) end)
+  local pf = readPresets(synth.file)
+  local found = nil
+  for _, p in ipairs(pf.presets) do if p.Name == name then found = p end end
+  if not found then found = {}; pf.presets[#pf.presets + 1] = found end
+  found.Data, found.Len, found.Name = hex, tostring(#state), name
+  if not writePresets(synth.file, pf) then synth.msg = "Non riesco a scrivere il file dei preset" return end
+  idFor(name)
+  refreshSynthList(reaper.time_precise())
+  -- the sound is already the current one: selecting it tells us if REAPER sees the new preset
+  reaper.TrackFX_SetPreset(synth.track, synth.fx, name)
+  local _, cur = reaper.TrackFX_GetPreset(synth.track, synth.fx, "")
+  synth.msg = (cur == name) and ("Salvato: " .. name)
+    or ("Salvato: " .. name .. " (se non lo carica, riavvia REAPER una volta)")
+end
+
+local function loadSound(id)
+  if not synth.track then scanSynth() end
+  if not synth.track then return end
+  if not synth.ids then loadIds() end
+  local name = synth.ids.byId[id]
+  if not name then synth.msg = "Suono " .. id .. " non trovato" return end
+  local ok = reaper.TrackFX_SetPreset(synth.track, synth.fx, name)
+  synth.msg = ok and "" or ("Non riesco a caricare " .. name)
+end
+
+local function deleteSound(id)
+  if not synth.ids then loadIds() end
+  local name = synth.ids.byId[id]
+  if not name or synth.file == "" then return end
+  local pf = readPresets(synth.file)
+  for i = #pf.presets, 1, -1 do if pf.presets[i].Name == name then table.remove(pf.presets, i) end end
+  writePresets(synth.file, pf)
+  refreshSynthList(reaper.time_precise())
+end
+
+local function synthJson()
+  local items = {}
+  for _, s in ipairs(synth.list) do
+    items[#items + 1] = string.format('{"id":%d,"name":%s}', s.id, jsonStr(s.name))
+  end
+  local cur = ""
+  if synth.track and synth.fx >= 0 then
+    local ok, p = reaper.TrackFX_GetPreset(synth.track, synth.fx, "")
+    if ok then cur = p or "" end
+  end
+  return string.format('{"ok":%d,"fx":%s,"cur":%s,"msg":%s,"list":[%s]}',
+    synth.track and 1 or 0, jsonStr((synth.fxname or ""):gsub("^%w+:%s*", "")), jsonStr(cur),
+    jsonStr(synth.msg), table.concat(items, ","))
 end
 
 ---------------------------------------------------------------- memories (save / load)
@@ -552,6 +965,10 @@ local function startShow()
   run = { state = 1, start = start, paused = 0, bar = bar, fired = {}, booked = {},
           check = {}, nbook = 0, ndone = 0, nfall = 0 }
   if show.tempo and show.tempo > 0 then reaper.SetCurrentBPM(0, show.tempo, false) end
+  -- uno stacco anche sulla drum? serve il gate sulle sue tracce
+  for _, e in ipairs(show.events) do
+    if e.t == 17 and e.l == 0 and math.floor(e.v / 4096) % 2 == 1 then ensureGate() break end
+  end
 end
 
 local function stopShow()
@@ -561,6 +978,11 @@ local function stopShow()
       local id, s = key:match("^(%d+):(%d+)$")
       if id then push(tonumber(id), 28, tonumber(s)) end   -- act 0 = cancel
     end
+  end
+  -- e gli stacchi prenotati
+  if run.nstk and run.nstk > 0 then
+    for _, l in ipairs(loopers) do push(l.id, 31, 8) end
+    gateClear()
   end
   run = { state = 0 }
 end
@@ -613,11 +1035,26 @@ local function fireEvent(e)
     local half = math.max(1, math.min(128, e.v))
     if e.s >= 0 then push(e.l, 21, sec + 8 * (half * 2 + dir))
     else push(e.l, 20, half * 2 + dir) end
-  elseif e.t == 7 then
-    if e.s >= 0 then push(e.l, 25, sec + 8 * e.v) else push(e.l, 23, e.v) end
-  elseif e.t >= 8 and e.t <= 10 then
-    local band = e.t - 8
-    if e.s >= 0 then push(e.l, 26, sec + 8 * (band + 3 * e.v)) else push(e.l, 24, band + 3 * e.v) end
+  elseif e.t >= 7 and e.t <= 10 then
+    -- filter (7) / low mid high (8..10): v = value 0..200 + 256 * transition in quarter
+    -- bars (0 = right away). The transition runs in the JSFX, locked to the beat.
+    local val = e.v % 256
+    local q = math.floor(e.v / 256)
+    local kind = e.t - 7
+    local ids = {}
+    if e.l == 0 then for _, l in ipairs(loopers) do ids[#ids + 1] = l.id end else ids[1] = e.l end
+    for _, id in ipairs(ids) do
+      if q > 0 and looperVer(id) >= 12 then
+        local dur4 = math.min(1023, math.floor(q / 4 * run.bar * 4 + 0.5))
+        local beat4 = math.floor(eventQN(e) * 4 + 0.5)
+        push(id, 32, (e.s >= 0 and sec or 8) + 16 * (kind + 4 * (val + 256 * (dur4 + 1024 * beat4))))
+      elseif kind == 0 then
+        if e.s >= 0 then push(id, 25, sec + 8 * val) else push(id, 23, val) end
+      else
+        local band = kind - 1
+        if e.s >= 0 then push(id, 26, sec + 8 * (band + 3 * val)) else push(id, 24, band + 3 * val) end
+      end
+    end
   elseif e.t == 11 then
     if e.v == 2 or (e.v == 0) ~= (drums.mute == 1) then toggleDrums() end
   elseif e.t == 12 then
@@ -626,7 +1063,32 @@ local function fireEvent(e)
     push(e.l, 3, 0)
   elseif e.t == 15 then
     push(e.l, 4, 0)
+  elseif e.t == 16 then
+    sendPattern(e.v)
+  elseif e.t == 18 then
+    loadSound(e.v)
   end
+end
+
+-- stacco: v = pos + 64*dur (+ 4096 if the drum stops too), pos / dur in eighths.
+-- Booked in the JSFX (and in the drum gate) for the exact beats.
+local function bookStacco(e, at)
+  local pos = e.v % 64
+  local dur = math.floor(e.v / 64) % 64
+  local withDrum = math.floor(e.v / 4096) % 2 == 1
+  if dur < 1 then return end
+  local a = at + pos * 0.5
+  local b = a + dur * 0.5
+  local arg = 16 * (dur * 2 + 1024 * math.floor(a * 4 + 0.5))
+  if e.l == 0 then
+    for _, l in ipairs(loopers) do push(l.id, 31, 8 + arg) end
+    if withDrum then gateWindow(a, b) end
+  elseif e.s < 0 then
+    push(e.l, 31, 8 + arg)
+  else
+    push(e.l, 31, e.s + arg)
+  end
+  run.nstk = (run.nstk or 0) + 1
 end
 
 local function runShow()
@@ -651,7 +1113,10 @@ local function runShow()
 
   local lookahead = run.bar                 -- book the section actions one bar ahead
   local lastBar = 0
+  for _, e in ipairs(show.events) do lastBar = math.max(lastBar, e.bar) end
+  local holdBar = nil                       -- a wait still to come: nothing after it is booked
   for i, e in ipairs(show.events) do
+    if holdBar and e.bar > holdBar then break end
     if not run.fired[i] then
       local at = eventQN(e)
       if e.t == 13 then                     -- wait
@@ -661,6 +1126,7 @@ local function runShow()
           run.holdAt = at
           return
         end
+        holdBar = e.bar
       elseif e.t >= 1 and e.t <= 4 and e.s >= 0 then
         local key = e.l .. ":" .. e.s
         local canBook = looperVer(e.l) >= 10
@@ -683,12 +1149,22 @@ local function runShow()
             run.nfall = (run.nfall or 0) + 1
           end
         end
+      elseif e.t == 17 then                 -- stacco: booked a bar ahead, the JSFX does the rest
+        if at <= now + lookahead then
+          run.fired[i] = true
+          run.ndone = (run.ndone or 0) + 1
+          bookStacco(e, at)
+        end
+      elseif e.t == 16 then                 -- pattern: sent a bit early if so set
+        if now >= at - unoSetting("uno_lead", 0) * 0.5 then
+          run.fired[i] = true
+          fireEvent(e)
+        end
       elseif now >= at then
         run.fired[i] = true
         fireEvent(e)
       end
     end
-    lastBar = math.max(lastBar, e.bar)
   end
 
   -- past the end: the scaletta is over
@@ -734,6 +1210,15 @@ local function handle(target, code, arg)
   if code == 200 then startJob("save", arg) return end
   if code == 201 then startJob("load", arg) return end
   if code == 202 then toggleDrums() return end       -- drum machine: mute / unmute at the bar
+  if code == 203 then                                -- drum machine: resync (again = cancel)
+    if sync.beat > 0 then sync.beat, sync.bar = 0, 0; reaper.gmem_write(GATE + 10, 0) else requestResync() end
+    return
+  end
+  if code == 204 then                                -- resync settings: auto + 2*pattern bars
+    reaper.SetExtState(EXT, "drum_sync_auto", tostring(arg % 2), true)
+    reaper.SetExtState(EXT, "drum_patlen", tostring(math.max(1, math.floor(arg / 2))), true)
+    return
+  end
   -- scaletta
   if code == 210 then show = parseShow(reaper.GetExtState(EXT, "show")) return end
   if code == 211 then saveShow(arg) return end
@@ -742,6 +1227,15 @@ local function handle(target, code, arg)
   if code == 214 then startShow() return end
   if code == 215 then stopShow() return end
   if code == 216 then continueShow() return end
+  if code == 217 then sendPattern(arg) return end
+  if code == 220 then saveSound() return end           -- synth: save the current sound
+  if code == 221 then loadSound(arg) return end        -- synth: load sound id
+  if code == 222 then deleteSound(arg) return end      -- synth: delete sound id      -- pattern now (to try it)
+  if code == 218 then                                  -- pattern settings: ofs + 2*lead
+    reaper.SetExtState(EXT, "uno_ofs", tostring(arg % 2), true)
+    reaper.SetExtState(EXT, "uno_lead", tostring(math.floor(arg / 2)), true)
+    return
+  end
   if AUTO_TRANSPORT and (code == 1 or code == 2 or code == 3) and not isPlaying() then
     reaper.OnPlayButton()
   end
@@ -818,14 +1312,20 @@ local function buildState(now)
       jsonStr(job.msg or ""), jsonStr(job.err or ""))
   end
 
-  local drumsJson = string.format('{"n":%d,"mute":%d,"pend":%d}',
-    #drums.tracks, drums.mute, drums.want)
+  local syncJson = string.format('{"bar":%d,"auto":%d,"len":%d,"x":%d,"n":%d,"miss":%d,"out":%d}',
+    sync.bar, syncSetting("drum_sync_auto", 1), syncSetting("drum_patlen", 1), sync.xruns, sync.n, sync.miss,
+    midiOutOk() and 1 or 0)
+  local drumsJson = string.format('{"n":%d,"mute":%d,"pend":%d,"gate":%d,"sync":%s,' ..
+    '"uno":{"dev":%d,"name":%s,"last":%d,"sent":%d,"err":%s,"ofs":%d,"lead":%d,"api":%d}}',
+    #drums.tracks, drums.mute, drums.want, gateAlive(now) and 1 or 0, syncJson,
+    uno.dev, jsonStr(uno.name), uno.last, uno.sent, jsonStr(uno.err),
+    unoSetting("uno_ofs", 0), unoSetting("uno_lead", 0), reaper.SendMIDIMessageToHardware and 1 or 0)
 
   return string.format(
     '{"t":%d,"proto":%d,"sess":%s,"ack":%d,"playing":%s,"tempo":%s,"loopers":[%s],"mem":[%s],' ..
-    '"job":%s,"drums":%s,"show":%s}',
+    '"job":%s,"drums":%s,"synth":%s,"show":%s}',
     tick, PROTO, jsonStr(lastSess), lastSeq, isPlaying() and "true" or "false",
-    num(reaper.Master_GetTempo()), table.concat(out, ","), table.concat(mem, ","), jobJson, drumsJson,
+    num(reaper.Master_GetTempo()), table.concat(out, ","), table.concat(mem, ","), jobJson, drumsJson, synthJson(),
     showState())
 end
 
@@ -837,11 +1337,16 @@ local function step()
   if now - lastScan > SCAN_EVERY then
     scan()
     scanDrums()
+    scanUno()
+    scanSynth()
+    if not isPlaying() then prepareDrumSync(false) end   -- gate + MIDI out ready before playing
+    if now - synth.listAt > 10 then refreshSynthList(now) end
     if not job or job.done then refreshSlots(); refreshShowSlots() end
     lastScan = now
   end
   readCommands()
   runDrums()
+  runSync()
   runShow()
   runJob(now)
   reaper.SetExtState(EXT, "state", buildState(now), false)

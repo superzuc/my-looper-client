@@ -31,7 +31,7 @@ desc:MyLooper - 8-section tempo-synced looper, controlled from iPad (inspired by
 // Looper ID = order of the track in the project). Layout per looper, base = ID*1024:
 //   +0 heartbeat  +1 rec length (beats)  +2 mode  +3 rec-grid pos (0..1)  +4 running
 //   +5 ts_num  +6 rec length (secs)  +7 monitor  +8 can double  +9 ts_denom
-//   +10 max loop length (secs)  +11 protocol version (10)
+//   +10 max loop length (secs)  +11 protocol version (12)
 //   +12 undo section (-1 = none)  +13 undo state (0 none, 1 undo, 2 redo)
 //   +112..115 looper filter, low, mid, high   +116 fade kind (1 out, 2 in)
 //   +120+s*6: filter, low, mid, high, fade gain, fade kind  (per section)
@@ -58,6 +58,14 @@ desc:MyLooper - 8-section tempo-synced looper, controlled from iPad (inspired by
 //   28 book an action for an exact beat (scaletta):
 //      s + 8*act + 64*(beat*2), act 1 = pause, 2 = play, 3 = rec, 4 = silent rec
 //      (act 0 cancels what was booked for that section)
+//   30 set the length of one section (s + 8*(beats*2))
+//   31 stacco (scaletta): silence for a window of the timeline, the loops keep
+//      running underneath and come back in phase. arg = t + 16*(dur*4 + 1024*(beat*4)),
+//      t = section 0..7 or 8 = whole looper, beat / dur in quarter notes (1/16 steps).
+//      dur 0 = cancel. Two windows per section can be booked at once.
+//   32 filter / EQ transition (scaletta): arg = t + 16*(kind + 4*(val + 256*(dur*4 + 1024*beat*4)))
+//      t = section 0..7 or 8 = looper bus, kind 0 filter 1 low 2 mid 3 high, val 0..200
+//      (as in 23..26), from beat for dur quarter notes. Moving that knob by hand stops it.
 //   30 set the length of a section: s + 8*(beats*2)
 //   late_ms = how long the UI held the tap back (to tell it from a double tap):
 //   it widens the late-press grace for that command.
@@ -158,7 +166,16 @@ SCHB = SECMEM + 376;  // beat of the project timeline it has to happen at
 // before); a take started by the scaletta at bar 2 keeps bar 2 as its start, so it
 // loops 2-6-10 instead of being forced onto 1-5-9 (which recorded it rotated).
 SPHB = SECMEM + 384;
-SECEND = SECMEM + 392;
+// stacchi (command 31): two windows per section, [s] and [s + 8], in quarter notes
+STKA = SECMEM + 392;  // where the silence starts
+STKB = SECMEM + 408;  // where it ends (0 = free)
+// filter / EQ transitions (command 32): slot = target*4 + kind, target 0..7 sections, 8 looper
+RST = SECMEM + 424;   // 0 off, 1 waiting for its beat, 2 running
+RFROM = SECMEM + 460; // value when it started (0..200)
+RTO = SECMEM + 496;   // where it goes
+RB0 = SECMEM + 532;   // from this beat
+RB1 = SECMEM + 568;   // to this beat
+SECEND = SECMEM + 604;
 XF = 18432;           // gmem audio transfer area
 
 ext_noinit == 0 ? (
@@ -568,6 +585,36 @@ function set_looper_eq(band, v) local(g)
   band == 0 ? leql = g : band == 1 ? leqm = g : leqh = g;
 );
 function fx_reset_sec(s) ( SFIL[s] = 0; SEQL[s] = 1; SEQM[s] = 1; SEQH[s] = 1; );
+
+// transitions: read / write a knob in its 0..200 units
+function fx_get(i) local(t, k)
+(
+  t = floor(i / 4); k = i % 4;
+  t >= 8 ? (
+    k == 0 ? lfil * 100 + 100 : k == 1 ? leql * 100 : k == 2 ? leqm * 100 : leqh * 100;
+  ) : (
+    k == 0 ? SFIL[t] * 100 + 100 : k == 1 ? SEQL[t] * 100 : k == 2 ? SEQM[t] * 100 : SEQH[t] * 100;
+  );
+);
+function fx_set(i, v) local(t, k)
+(
+  t = floor(i / 4); k = i % 4;
+  t >= 8 ? ( k == 0 ? set_looper_filter(v) : set_looper_eq(k - 1, v); ) :
+           ( k == 0 ? set_sec_filter(t, v) : set_sec_eq(t, k - 1, v); );
+);
+function fx_ramp(raw) local(t, v, k, val, d, b, i)
+(
+  t = raw % 16; v = floor(raw / 16);
+  k = v % 4; v = floor(v / 4);
+  val = v % 256; v = floor(v / 256);
+  d = (v % 1024) / 4; b = floor(v / 1024) / 4;
+  t = min(t, 8);
+  i = t * 4 + k;
+  d <= 0 ? ( RST[i] = 0; fx_set(i, val); ) : (
+    RTO[i] = val; RB0[i] = b; RB1[i] = b + d; RST[i] = 1; rmp_on = 1;
+  );
+);
+function ramp_stop(i) ( RST[i] = 0; );
 function fx_reset(a) local(s)
 (
   a == 0 ? ( lfil = 0; leql = 1; leqm = 1; leqh = 1; ) :
@@ -671,6 +718,30 @@ function sched_sec(s, act, beat)
   act ? ( SCHA[s] = act; SCHB[s] = beat; ) : ( SCHA[s] = 0; );
 );
 
+// stacco: a window where the section is silent. It only gates the output, the loop
+// keeps turning, so when the window ends the music is exactly where it should be.
+function stacco_sec(s, a, b) local(k)
+(
+  // a free window (already over), else the one that ends first
+  k = STKB[s] <= beat_position ? s : STKB[s + 8] <= beat_position ? s + 8 :
+      STKB[s] <= STKB[s + 8] ? s : s + 8;
+  STKA[k] = a;
+  STKB[k] = b;
+  stk_on = 1;
+);
+function stacco(raw) local(t, v, d, a, s)
+(
+  t = raw % 16;
+  v = floor(raw / 16);
+  d = (v % 1024) / 4;
+  a = floor(v / 1024) / 4;
+  d <= 0 ? (
+    t >= 8 ? memset(STKA, 0, 32) : ( STKA[t] = STKB[t] = STKA[t + 8] = STKB[t + 8] = 0; );
+  ) : (
+    t >= 8 ? ( s = 0; loop(NSEC, stacco_sec(s, a, a + d); s += 1; ); ) : stacco_sec(t, a, a + d);
+  );
+);
+
 // double tap: play / pause right now, without waiting for the end of the bar
 function tap_now(s) local(st)
 (
@@ -712,13 +783,15 @@ function handle(c, raw) local(a, v)
   c == 20 ? fade_run(floor(a / 2), a % 2) :
   c == 21 ? fade_sec(a, floor(v / 2), v % 2) :
   c == 22 ? tap_now(a) :
-  c == 23 ? set_looper_filter(a) :
-  c == 24 ? set_looper_eq(a % 3, floor(a / 3)) :
-  c == 25 ? set_sec_filter(a, v) :
-  c == 26 ? set_sec_eq(a, v % 3, floor(v / 3)) :
-  c == 27 ? fx_reset(raw) :
+  c == 23 ? ( ramp_stop(32); set_looper_filter(a); ) :
+  c == 24 ? ( ramp_stop(33 + a % 3); set_looper_eq(a % 3, floor(a / 3)); ) :
+  c == 25 ? ( ramp_stop(a * 4); set_sec_filter(a, v); ) :
+  c == 26 ? ( ramp_stop(a * 4 + 1 + v % 3); set_sec_eq(a, v % 3, floor(v / 3)); ) :
+  c == 27 ? ( memset(RST, 0, 36); fx_reset(raw); ) :
+  c == 32 ? fx_ramp(raw) :
   c == 28 ? sched_sec(a, v % 8, floor(v / 8) / 2) :
   c == 30 ? sec_set_beats(a, v / 2) :
+  c == 31 ? stacco(raw) :
   c == 17 ? ( a >= 1 && floor(a / 2 * spb + 0.5) <= MAXLEN ? set_beats(a / 2); );
   extra_grace = 0;
 );
@@ -812,7 +885,7 @@ looper_id >= 1 ? (
   gmem[GB + 8] = floor(cur_beats() * 2 * spb + 0.5) <= MAXLEN;
   gmem[GB + 9] = ts_denom;
   gmem[GB + 10] = MAXLEN / srate;
-  gmem[GB + 11] = 10;                      // protocol version (bridge/UI check it)
+  gmem[GB + 11] = 12;                      // protocol version (bridge/UI check it)
   gmem[GB + 12] = usec;
   gmem[GB + 13] = usec >= 0 ? (ustate == 2 ? 2 : 1) : 0;
   s = 0;
@@ -873,6 +946,22 @@ running ? (
   );
 );
 
+// stacchi: drop the windows already over (and all of them when the transport stops,
+// or a window booked for beat 40 would hit again after going back to the start)
+stk_on ? (
+  running ? (
+    stk_on = 0;
+    k = 0;
+    loop(16,
+      STKB[k] > 0 ? ( beat_position >= STKB[k] ? ( STKA[k] = STKB[k] = 0; ) : stk_on = 1; );
+      k += 1;
+    );
+  ) : (
+    memset(STKA, 0, 32);
+    stk_on = 0;
+  );
+);
+
 // the same, section by section
 s = 0;
 loop(NSEC,
@@ -889,6 +978,24 @@ loop(NSEC,
   );
   SFST[s] = (sf_t - SFG[s]) / max(samplesblock, 1);
   s += 1;
+);
+
+// filter / EQ transitions of the scaletta, locked to the beat
+rmp_on ? (
+  rmp_on = 0;
+  ri = 0;
+  loop(36,
+    RST[ri] ? (
+      !running ? ( fx_set(ri, RTO[ri]); RST[ri] = 0; ) :
+      beat_position >= RB0[ri] ? (
+        RST[ri] == 1 ? ( RFROM[ri] = fx_get(ri); RST[ri] = 2; );
+        rfr = (beat_position - RB0[ri]) / max(RB1[ri] - RB0[ri], 0.001);
+        rfr >= 1 ? ( fx_set(ri, RTO[ri]); RST[ri] = 0; ) : fx_set(ri, RFROM[ri] + (RTO[ri] - RFROM[ri]) * rfr);
+      );
+      RST[ri] ? rmp_on = 1;
+    );
+    ri += 1;
+  );
 );
 
 // filter / EQ: the values are smoothed per block, so a knob never clicks
@@ -953,6 +1060,7 @@ oL = oR = 0;      // main bus
 cL = cR = 0;      // cue bus (in-ears only)
 
 running ? (
+  stk_q = stk_on ? now_qn() : -1;
   s = 0;
   bl = BUF0;
   loop(NSEC,
@@ -970,7 +1078,8 @@ running ? (
     br = bl + MAXLEN;
     st = STATE[s];
     g = GAIN[s];
-    g += ((st >= 2 && !SMUTE[s] && !(s == usec && uswap >= 0)) - g) * fade_k;
+    sk = stk_on && ((stk_q >= STKA[s] && stk_q < STKB[s]) || (stk_q >= STKA[s + 8] && stk_q < STKB[s + 8]));
+    g += ((st >= 2 && !SMUTE[s] && !sk && !(s == usec && uswap >= 0)) - g) * fade_k;
     GAIN[s] = g;
     SFG[s] = max(0, min(1, SFG[s] + SFST[s]));   // fade of this section
     // volume + pan (balance), smoothed

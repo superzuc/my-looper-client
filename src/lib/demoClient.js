@@ -6,7 +6,7 @@ const GRACE_S = 0.15;
 
 function makeLooper(id, name, color, beats) {
   return {
-    id, name, color, alive: true, ver: 10, beats, mode: 1, pos: 0, running: 1,
+    id, name, color, alive: true, ver: 12, beats, mode: 1, pos: 0, running: 1,
     fade: 0, fadeK: 0, fadeG: 1, fadeB0: 0, fadeB1: 0,
     fil: 0, lo: 1, mid: 1, hi: 1,
     tsNum: 4, tsDenom: 4, lenSec: 0, mon: 1, canDouble: 1, maxSec: 40,
@@ -50,7 +50,12 @@ export class DemoClient {
     this.mem[0] = { slot: 1, saved: '21/09 22:14', n: 3, tempo: '96' };
     this.job = null;
     this.saved = {};
-    this.drums = { n: 2, mute: 0, pend: -1 };
+    this.drums = { n: 2, mute: 0, pend: -1, gate: 1, sync: { bar: 0, auto: 1, len: 1, x: 0, n: 0, miss: 0, out: 1 } };
+    this.synth = {
+      ok: 1, fx: 'Splice INSTRUMENT (Splice)', cur: 'Piano Granular (Opia)', msg: '',
+      list: [{ id: 1, name: 'Piano Granular (Opia)' }, { id: 2, name: 'Granular Choir (Astral Forms)' }],
+    };
+    this.uno = { dev: 4, name: 'UNO Drum', last: 0, sent: 0, err: '', ofs: 0, lead: 0, api: 1 };
     this.drumTarget = 0;
     // scaletta
     this.showText = '';
@@ -89,6 +94,42 @@ export class DemoClient {
         r.holdAt = at;
         return;
       }
+      if (e.t === EV.PATTERN) {
+        this.uno.last = e.v;
+        this.uno.sent += 1;
+        return;
+      }
+      if (e.t === EV.DRUMS) {
+        if (e.v === 2 || (e.v === 0) !== (this.drums.mute === 1)) this.send(0, CMD.DRUMS);
+        return;
+      }
+      if (e.t === EV.TEMPO) {
+        if (e.v > 0) this.tempo = e.v / 100;
+        return;
+      }
+      if (e.t === EV.STACCO) return; // in the demo there is no audio to silence
+      if (e.t >= EV.FILTER && e.t <= EV.EQ_HI) {
+        // the demo jumps straight to the value (the real JSFX does the transition)
+        const val = e.v % 256;
+        const sec = e.s >= 0 ? e.s : 0;
+        const ids = e.l === 0 ? this.loopers.map((x) => x.id) : [e.l];
+        ids.forEach((id) => {
+          if (e.t === EV.FILTER) {
+            if (e.s >= 0) this.send(id, CMD.FILTER_SEC, sec + 8 * val);
+            else this.send(id, CMD.FILTER, val);
+          } else {
+            const band = e.t - EV.EQ_LO;
+            if (e.s >= 0) this.send(id, CMD.EQ_SEC, sec + 8 * (band + 3 * val));
+            else this.send(id, CMD.EQ, band + 3 * val);
+          }
+        });
+        return;
+      }
+      if (e.t === EV.SYNTH) {
+        const x = this.synth.list.find((y) => y.id === e.v);
+        if (x) this.synth.cur = x.name;
+        return;
+      }
       const l = this.loopers.find((x) => x.id === e.l);
       if (!l) return;
       const sec = e.s >= 0 ? e.s : 0;
@@ -102,17 +143,13 @@ export class DemoClient {
         const dir = e.t === EV.FADE_IN ? 1 : 0;
         if (e.s >= 0) this.send(l.id, CMD.FADE_SEC, sec + 8 * (e.v * 2 + dir));
         else this.send(l.id, CMD.FADE, e.v * 2 + dir);
-      } else if (e.t === EV.FILTER) {
-        if (e.s >= 0) this.send(l.id, CMD.FILTER_SEC, sec + 8 * e.v);
-        else this.send(l.id, CMD.FILTER, e.v);
-      } else if (e.t >= EV.EQ_LO && e.t <= EV.EQ_HI) {
-        const band = e.t - EV.EQ_LO;
-        if (e.s >= 0) this.send(l.id, CMD.EQ_SEC, sec + 8 * (band + 3 * e.v));
-        else this.send(l.id, CMD.EQ, band + 3 * e.v);
       } else if (e.t === EV.DRUMS) {
         if ((e.v === 0) !== (this.drums.mute === 1)) this.send(0, CMD.DRUMS);
       } else if (e.t === EV.TEMPO && e.v > 0) {
         this.tempo = e.v / 100;
+      } else if (e.t === EV.PATTERN) {
+        this.uno.last = e.v;
+        this.uno.sent += 1;
       }
     });
     const last = this.show.events.reduce((a, e) => Math.max(a, e.bar), 0);
@@ -235,13 +272,14 @@ export class DemoClient {
               return e ? `bar ${e.bar}` : '';
             })()
           : '',
-        ver: 10,
+        ver: 12,
         book: this.run.nbook || 0,
         done: this.run.ndone || 0,
         fall: 0,
         slots: this.showSlots,
       },
-      drums: { ...this.drums },
+      drums: { ...this.drums, sync: { ...this.drums.sync }, uno: { ...this.uno } },
+      synth: { ...this.synth, list: [...this.synth.list] },
       job: this.job && { kind: this.job.kind, slot: this.job.slot, p: this.job.p, done: this.job.done, msg: this.job.msg, err: '' },
       playing: this.playing,
       tempo: this.tempo,
@@ -333,6 +371,21 @@ export class DemoClient {
       this.playing = true;
       this.t0 = performance.now();
     }
+    if (code === CMD.DRUM_SYNC) {
+      const sy = this.drums.sync;
+      clearTimeout(this.syncT);
+      if (sy.bar) { sy.bar = 0; return; }
+      const m = this.measureSec();
+      const t = (performance.now() - this.t0) / 1000;
+      sy.bar = Math.floor(t / m) + 2;
+      this.syncT = setTimeout(() => { sy.bar = 0; sy.n += 1; }, (Math.ceil(t / m) * m - t) * 1000 + 300);
+      return;
+    }
+    if (code === CMD.DRUM_SYNC_SET) {
+      this.drums.sync.auto = arg % 2;
+      this.drums.sync.len = Math.max(1, Math.floor(arg / 2));
+      return;
+    }
     if (code === CMD.DRUMS) {
       if (this.drums.pend >= 0) { this.drums.pend = -1; return; } // a second press cancels
       const want = this.drums.mute ? 0 : 1;
@@ -341,6 +394,33 @@ export class DemoClient {
       if (!this.playing || t % m < GRACE_S) { this.drums.mute = want; return; }
       this.drums.pend = want;
       this.drumTarget = Math.floor(t / m) + 1;
+      return;
+    }
+    if (code === CMD.UNO_PATTERN) {
+      this.uno.last = arg;
+      this.uno.sent += 1;
+      return;
+    }
+    if (code === CMD.SYNTH_SAVE) {
+      const n = this.synth.list.length + 1;
+      const name = `Suono demo ${n}`;
+      this.synth.list.push({ id: Math.max(0, ...this.synth.list.map((x) => x.id)) + 1, name });
+      this.synth.cur = name;
+      this.synth.msg = `Salvato: ${name}`;
+      return;
+    }
+    if (code === CMD.SYNTH_LOAD) {
+      const x = this.synth.list.find((y) => y.id === arg);
+      if (x) this.synth.cur = x.name;
+      return;
+    }
+    if (code === CMD.SYNTH_DELETE) {
+      this.synth.list = this.synth.list.filter((y) => y.id !== arg);
+      return;
+    }
+    if (code === CMD.UNO_SET) {
+      this.uno.ofs = arg % 2;
+      this.uno.lead = Math.floor(arg / 2);
       return;
     }
     if (code >= CMD.SHOW_SET && code <= CMD.SHOW_CONTINUE) {

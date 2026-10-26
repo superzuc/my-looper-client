@@ -29,10 +29,13 @@ export const CMD = {
   FX_RESET: 27,       // arg: 0 = looper, 1 + section, 9 = everything
   SCHED: 28,          // arg = section + 8*act + 64*(beat*2): booked by the scaletta
   SET_SEC_BEATS: 30,  // arg = section + 8*(beats*2): exact length of a section
+  STACCO: 31,         // arg = t + 16*(dur*4 + 1024*beat*4): silence window (scaletta)
   TRANSPORT: 100,  // handled by the Lua bridge: REAPER play/stop
   SAVE: 200,       // bridge: save all loopers in memory slot (arg 1..8)
   LOAD: 201,       // bridge: load memory slot (arg 1..8)
   DRUMS: 202,      // bridge: drum machine on / off (mute of its tracks, at the end of the bar)
+  DRUM_SYNC: 203,  // bridge: put the drum machine back on the bar (Stop + Start on a bar line)
+  DRUM_SYNC_SET: 204, // bridge: arg = auto (0/1) + 2*pattern length in bars
   SHOW_SET: 210,   // bridge: read the scaletta from the ExtState "show"
   SHOW_SAVE: 211,  // arg = slot 1..8
   SHOW_LOAD: 212,
@@ -40,12 +43,17 @@ export const CMD = {
   SHOW_START: 214,
   SHOW_STOP: 215,
   SHOW_CONTINUE: 216,
+  UNO_PATTERN: 217, // bridge: drum machine to pattern arg (1..100) right now
+  UNO_SET: 218,     // bridge: pattern settings, arg = ofs + 2*lead (eighths)
+  SYNTH_SAVE: 220,  // bridge: save the current sound of the synth as a preset
+  SYNTH_LOAD: 221,  // bridge: load sound id
+  SYNTH_DELETE: 222, // bridge: delete sound id
 };
 
 export const ALL_LOOPERS = 0;
 
 // must match MyLooper.jsfx (gmem +11) and MyLooper_bridge.lua
-export const PROTO = 10;
+export const PROTO = 12;
 
 // Section states
 export const ST = { EMPTY: 0, STOPPED: 1, PLAYING: 2, RECORDING: 3, OVERDUB: 4 };
@@ -96,6 +104,9 @@ export const EV = {
   WAIT: 13,
   PLAY_ALL: 14,
   STOP_ALL: 15,
+  PATTERN: 16,   // v = pattern of the drum machine (1..100)
+  STACCO: 17,    // v = stacArg(pos, dur, drum): silence inside the bar
+  SYNTH: 18,     // v = id of the synth sound
 };
 
 export const EV_INFO = {
@@ -114,7 +125,28 @@ export const EV_INFO = {
   [EV.WAIT]: { icon: 'ATT', label: 'Aspetta che prema', cls: 'wait' },
   [EV.PLAY_ALL]: { icon: '▶▶', label: 'Play di tutte', cls: 'play' },
   [EV.STOP_ALL]: { icon: '■', label: 'Stop di tutte', cls: 'stop' },
+  [EV.PATTERN]: { icon: 'PAT', label: 'Pattern drum', cls: 'drum' },
+  [EV.STACCO]: { icon: 'STC', label: 'Stacco', cls: 'stacco' },
+  [EV.SYNTH]: { icon: 'SYN', label: 'Suono synth', cls: 'synth' },
 };
+
+// stacco: position and length in eighths (pos 0 = on the 1 of the bar), drum = the
+// drum machine stops too (only from the Generale row)
+// filter / EQ in the scaletta: value 0..200 + transition in quarter bars (0 = right away)
+export const fxEvArg = (val, bars = 0) => Math.round(val) + 256 * Math.round(Math.max(0, bars) * 4);
+export const fxEvParts = (v) => ({ val: v % 256, bars: Math.floor(v / 256) / 4 });
+
+export const stacArg = (pos, dur, drum = false) =>
+  Math.max(0, Math.min(63, Math.round(pos))) + 64 * Math.max(1, Math.min(63, Math.round(dur))) + (drum ? 4096 : 0);
+export const stacParts = (v) => ({ pos: v % 64, dur: Math.floor(v / 64) % 64, drum: Math.floor(v / 4096) % 2 === 1 });
+// "1/8", "3/4", "1 bar"... for an eighth count, with the bar of this time signature
+export function eighthsLabel(n, barEighths = 8) {
+  if (n % barEighths === 0) return `${n / barEighths} bar`;
+  if (n % 2 === 0) return `${n / 2}/4`;
+  return `${n}/8`;
+}
+// "sul 1", "sul 2 e" (the eighth after the 2)
+export const posLabel = (pos) => `sul ${Math.floor(pos / 2) + 1}${pos % 2 ? ' e' : ''}`;
 
 // niente caratteri che darebbero fastidio nell'URL o nel formato
 const clean = (s) => String(s || '').replace(/[^\w .\-àèéìòù]/gi, ' ').slice(0, 40);

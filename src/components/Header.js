@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { ALL_LOOPERS, CMD, FADE_IN, FADE_OUT } from '../lib/protocol';
 import FadeButton, { FadeLen } from './FadeButton';
 
@@ -27,6 +28,19 @@ export default function Header({
   const drums = state?.drums;
   const drumsOff = !!(drums && drums.mute);
   const drumsPend = !!(drums && drums.pend >= 0);
+  const drumsSync = drums && drums.sync && drums.sync.bar > 0;
+  // tap = pausa / play; tenuto premuto = rimettila a tempo alla prossima bar
+  const holdRef = useRef({ t: null, fired: false });
+  const drumDown = () => {
+    holdRef.current.fired = false;
+    clearTimeout(holdRef.current.t);
+    holdRef.current.t = setTimeout(() => {
+      holdRef.current.fired = true;
+      send(ALL_LOOPERS, CMD.DRUM_SYNC);
+      if (navigator.vibrate) navigator.vibrate(30);
+    }, 700);
+  };
+  const drumUp = () => clearTimeout(holdRef.current.t);
   const loopers = state?.loopers || [];
   // the fade has to land on a bar, so it needs at least one looper in Bar mode
   const canFade = loopers.some((l) => l.mode);
@@ -88,12 +102,26 @@ export default function Header({
         {drums && (
           <button
             type="button"
-            className={`big-btn big-btn--drum ${drumsOff ? 'is-off' : ''} ${drumsPend ? 'is-pending' : ''}`}
+            className={`big-btn big-btn--drum ${drumsOff ? 'is-off' : ''} ${drumsPend ? 'is-pending' : ''} ${
+              drumsSync ? 'is-syncing' : ''
+            }`}
             disabled={!drums.n}
-            onClick={() => send(ALL_LOOPERS, CMD.DRUMS)}
-            title={drums.n ? 'Drum machine in pausa / in play (a fine bar)' : 'Nessuna traccia drum trovata'}
+            onPointerDown={drumDown}
+            onPointerUp={drumUp}
+            onPointerLeave={drumUp}
+            onPointerCancel={drumUp}
+            onContextMenu={(e) => e.preventDefault()}
+            onClick={() => {
+              if (holdRef.current.fired) return;   // era una pressione lunga
+              send(ALL_LOOPERS, CMD.DRUMS);
+            }}
+            title={
+              drums.n
+                ? 'Tocca: drum in pausa / in play (a fine bar) · Tieni premuto: rimettila a tempo'
+                : 'Nessuna traccia drum trovata'
+            }
           >
-            <span className="big-btn__icon">{drumsOff ? '▶' : '❚❚'}</span>
+            <span className="big-btn__icon">{drumsSync ? '⟳' : drumsOff ? '▶' : '❚❚'}</span>
             <span>Drum</span>
           </button>
         )}

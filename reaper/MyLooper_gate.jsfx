@@ -1,0 +1,78 @@
+desc:MyLooper Gate - stacchi e risincronizzazione della drum machine
+//author: Antonio
+//tags: looper utility
+//
+// Goes on the drum machine tracks (the bridge adds it by itself). Two jobs:
+//
+// 1. Stacchi: it silences the track for the windows the bridge writes in gmem, sample
+//    accurate, with a 4 ms ramp so it never clicks. The machine keeps running on the
+//    MIDI clock, so after the stacco it is in phase.
+//
+// 2. Resync: if REAPER hiccups the machine can lose MIDI clock ticks and drift off the
+//    bar. The bridge writes the beat of a bar line; half a clock tick before it this
+//    sends Stop + Start out of the track's MIDI output (the bridge points the first drum
+//    track's MIDI output to the machine), so the machine restarts its pattern on the
+//    clock tick of that bar line - exactly on the 1.
+//
+// gmem "MyLooper":
+//   64      heartbeat (written here, the bridge checks the gate is there)
+//   66+2k   start of window k (quarter notes of the timeline), k = 0..3
+//   67+2k   end of window k (0 = free)
+//   74      resync: beat of the bar line (0 = none)
+//   75      resync: request number (each one is sent once)
+//   76      resync: last request number sent (written here)
+
+options:gmem=MyLooper
+in_pin:L
+in_pin:R
+out_pin:L
+out_pin:R
+
+@init
+GT = 64;
+g = 1;
+sent_seq = -1;
+MB = 0;          // 2 bytes for Stop + Start
+
+@block
+running = (play_state & 1) ? 1 : 0;
+gate_k = 1 - exp(-1 / (srate * 0.004));
+gmem[GT] = (gmem[GT] + 1) % 1000000;
+smp_i = 0;
+any = 0;
+k = 0;
+loop(4, gmem[GT + 3 + 2 * k] > beat_position ? any = 1; k += 1; );
+
+// resync: Stop + Start half a MIDI clock tick (1/48 of a quarter) before the bar line,
+// so the first clock tick the machine counts after Start is the one on the bar line
+rs_beat = gmem[GT + 10];
+rs_seq = gmem[GT + 11];
+running && rs_beat > 0 && rs_seq != sent_seq ? (
+  rs_off = floor((rs_beat - 1 / 48 - beat_position) * 60 / tempo * srate);
+  rs_off < 0 && beat_position < rs_beat ? rs_off = 0;     // asked too late for the half tick: right away
+  rs_off >= 0 && rs_off < samplesblock ? (
+    MB[0] = $xFC;     // Stop
+    MB[1] = $xFA;     // Start
+    midisend_buf(rs_off, MB, 1);
+    midisend_buf(rs_off, MB + 1, 1);
+    sent_seq = rs_seq;
+    gmem[GT + 12] = rs_seq;
+  ) : beat_position >= rs_beat ? (
+    sent_seq = rs_seq;                                     // missed it: never send it late
+  );
+);
+
+@sample
+want = 1;
+running && any ? (
+  q = beat_position + smp_i / srate * tempo / 60;
+  k = 0;
+  loop(4,
+    q >= gmem[GT + 2 + 2 * k] && q < gmem[GT + 3 + 2 * k] ? want = 0;
+    k += 1;
+  );
+);
+g += (want - g) * gate_k;
+spl0 *= g;
+spl1 *= g;
+smp_i += 1;
