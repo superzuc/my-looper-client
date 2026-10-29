@@ -3,6 +3,7 @@ import {
   ALL_LOOPERS, CMD, EV, EV_INFO, FADE_STEPS, eighthsLabel, fxEvArg, fxEvParts, parseShow, posLabel, serializeShow, stacArg, stacParts,
 } from '../lib/protocol';
 import { fadeLabel } from './FadeButton';
+import HoldButton from './HoldButton';
 
 // La scaletta: il pezzo scritto prima. Righe = strumenti e sezioni, colonne = bar.
 // Tocchi una casella e scegli cosa deve succedere lì; dal vivo premi Avvia e il
@@ -11,9 +12,9 @@ import { fadeLabel } from './FadeButton';
 const GEN = 'gen';
 const rowKey = (l, s) => (l === 0 ? GEN : `${l}:${s}`);
 
-const SEC_ACTIONS = [EV.REC, EV.CUE_REC, EV.PLAY, EV.PAUSE, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
-const LOOP_ACTIONS = [EV.PLAY_ALL, EV.STOP_ALL, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
-const GEN_ACTIONS = [EV.WAIT, EV.STACCO, EV.DRUMS, EV.PATTERN, EV.SYNTH, EV.TEMPO, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
+const SEC_ACTIONS = [EV.REC, EV.CUE_REC, EV.PLAY, EV.PAUSE, EV.CLEAR, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
+const LOOP_ACTIONS = [EV.PLAY_ALL, EV.STOP_ALL, EV.CLEAR, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
+const GEN_ACTIONS = [EV.WAIT, EV.CLEAR, EV.STACCO, EV.DRUMS, EV.PATTERN, EV.SYNTH, EV.TEMPO, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
 const LEADS = [
   { v: 0, label: 'Sulla stanghetta' },
   { v: 1, label: '1/8 prima' },
@@ -48,7 +49,8 @@ function needsValue(t) {
 
 function staccoLabel(v, barEighths) {
   const p = stacParts(v);
-  return `${eighthsLabel(p.dur, barEighths)} ${posLabel(p.pos)}${p.drum ? ' · anche la drum' : ''}`;
+  const who = p.who === 'drum' ? ' · solo la drum' : p.who === 'all' ? ' · anche la drum' : '';
+  return `${eighthsLabel(p.dur, barEighths)} ${posLabel(p.pos)}${who}`;
 }
 
 // Stacco: da dove parte (gli ottavi della bar) e quanto dura. La musica sotto continua a
@@ -56,8 +58,10 @@ function staccoLabel(v, barEighths) {
 function StaccoPicker({ barEighths, gen, onAdd }) {
   const [pos, setPos] = useState(0);
   const [dur, setDur] = useState(2);
-  const [drum, setDrum] = useState(true);
-  const durs = [1, 2, 3, 4, 5, 6, 7].filter((d) => d < barEighths).concat([barEighths, barEighths * 2]);
+  const [who, setWho] = useState('all');
+  const durs = [1, 2, 3, 4, 5, 6, 7]
+    .filter((d) => d < barEighths)
+    .concat([barEighths, barEighths * 2, barEighths * 4].filter((d) => d <= 63));
   const cells = Array.from({ length: barEighths }, (_, i) => i);
   return (
     <div className="stc">
@@ -88,12 +92,22 @@ function StaccoPicker({ barEighths, gen, onAdd }) {
         ))}
       </div>
       {gen && (
-        <label className="stc__drum">
-          <input type="checkbox" checked={drum} onChange={(e) => setDrum(e.target.checked)} />
-          Si ferma anche la drum machine
-        </label>
+        <>
+          <div className="stc__label">Chi si ferma</div>
+          <div className="show-pick__grid stc__who">
+            {[
+              ['all', 'Tutti (looper + drum)'],
+              ['loopers', 'Solo i looper'],
+              ['drum', 'Solo la drum'],
+            ].map(([k, label]) => (
+              <button key={k} type="button" className={`chip chip--sm ${who === k ? 'is-on' : ''}`} onClick={() => setWho(k)}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </>
       )}
-      <button type="button" className="chip chip--ok stc__go" onClick={() => onAdd(stacArg(pos, dur, gen && drum))}>
+      <button type="button" className="chip chip--ok stc__go" onClick={() => onAdd(stacArg(pos, dur, gen ? who : 'loopers'))}>
         Metti lo stacco
       </button>
     </div>
@@ -152,6 +166,7 @@ function DrumBox({ uno, gate, sync, send }) {
           {!uno ? '' : uno.api === 0 ? 'REAPER troppo vecchio per mandare i pattern'
             : uno.dev >= 0 ? `uscita MIDI: ${uno.name}` : 'UNO Drum non trovata tra le uscite MIDI di REAPER'}
           {uno && uno.last > 0 ? ` · ultimo pattern ${uno.last}` : ''}
+          {uno && uno.route ? ` (${uno.route === 'gate' ? 'dal gate della traccia drum' : 'diretto'})` : ''}
           {gate ? ' · gate per gli stacchi ok' : ''}
         </span>
       </div>
@@ -384,6 +399,21 @@ export default function ShowPanel({ state, send, client, onClose }) {
     if (el && el.scrollIntoView) el.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
   }, [curBar, running]);
 
+  // quanto dura una rec della scaletta: fino al play / pausa dopo, sulla stessa sezione
+  const recLenLabel = (e) => {
+    const next = show.events
+      .filter(
+        (f) =>
+          f.bar > e.bar && f.l === e.l &&
+          ((f.s === e.s && (f.t === EV.PLAY || f.t === EV.PAUSE)) ||
+            (f.s < 0 && (f.t === EV.PLAY_ALL || f.t === EV.STOP_ALL)))
+      )
+      .sort((a, b) => a.bar - b.bar)[0];
+    if (!next) return 'lunga quanto la rec dello strumento';
+    const n = next.bar - e.bar;
+    return `${n} bar (fino alla bar ${next.bar})`;
+  };
+
   const actionsFor = (row) => (row.key === GEN ? GEN_ACTIONS : row.s >= 0 ? SEC_ACTIONS : LOOP_ACTIONS);
   const presetsFor = (t) =>
     t === EV.FILTER ? FILTER_PRESETS
@@ -415,6 +445,12 @@ export default function ShowPanel({ state, send, client, onClose }) {
               <span>Ferma</span>
             </button>
           )}
+          {running && !waiting && (
+            <button type="button" className="big-btn big-btn--back" onClick={() => send(ALL_LOOPERS, CMD.SHOW_BACK)}>
+              <span className="big-btn__icon">↶</span>
+              <span>Indietro{live.back > 0 ? ` ${live.back}` : ''}</span>
+            </button>
+          )}
           {waiting && (
             <button
               type="button"
@@ -425,12 +461,20 @@ export default function ShowPanel({ state, send, client, onClose }) {
               <span>Continua</span>
             </button>
           )}
+          <HoldButton
+            ms={1000}
+            className="chip chip--danger show-run__clear"
+            onHold={() => send(ALL_LOOPERS, CMD.CLEAR_ALL)}
+          >
+            Svuota tutto <small>(tieni premuto)</small>
+          </HoldButton>
           <div className="show-run__info">
             {running ? (
               <>
                 <strong>bar {curBar}</strong>
                 <span className="muted">
-                  {waiting ? ' · in attesa, tocca Continua' : live.next ? ` · prossimo: ${live.next}` : ''}
+                  {waiting ? ' · in attesa, tocca Continua' : live.back > 0 ? ` · rifà dalla bar ${curBar + 1}`
+                    : live.next ? ` · prossimo: ${live.next}` : ''}
                 </span>
               </>
             ) : (
@@ -439,7 +483,7 @@ export default function ShowPanel({ state, send, client, onClose }) {
           </div>
         </div>
 
-        {live && live.ver > 0 && live.ver < 12 && (
+        {live && live.ver > 0 && live.ver < 15 && (
           <div className="show-warn">
             In REAPER è caricato un <strong>JSFX vecchio (v{live.ver})</strong>: chiudi e riapri il progetto per
             ricaricarlo. Finché non lo fai gli stacchi e le transizioni di filtro/EQ non funzionano
@@ -547,7 +591,7 @@ export default function ShowPanel({ state, send, client, onClose }) {
 
         <div className="show-legend">
           <span className="muted">Tocca una casella per decidere cosa succede a quella bar.</span>
-          {[EV.REC, EV.PLAY, EV.PAUSE, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.PATTERN, EV.SYNTH, EV.WAIT].map((t) => (
+          {[EV.REC, EV.PLAY, EV.PAUSE, EV.CLEAR, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.PATTERN, EV.SYNTH, EV.WAIT].map((t) => (
             <span key={t} className="show-legend__item">
               <span className={`showev showev--${EV_INFO[t].cls}`}>{EV_INFO[t].icon}</span>
               {EV_INFO[t].label}
@@ -580,6 +624,7 @@ export default function ShowPanel({ state, send, client, onClose }) {
                       <span className={`showev showev--${EV_INFO[e.t]?.cls}`}>{EV_INFO[e.t]?.icon}</span>
                       {EV_INFO[e.t]?.label}
                       {needsValue(e.t) && <small> · {valueLabel(e, barEighths, synthList)}</small>}
+                      {(e.t === EV.REC || e.t === EV.CUE_REC) && <small> · {recLenLabel(e)}</small>}
                       <button type="button" className="chip chip--danger" onClick={() => removeEvent(e.i)}>
                         Togli
                       </button>

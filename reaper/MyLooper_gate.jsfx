@@ -21,6 +21,14 @@ desc:MyLooper Gate - stacchi e risincronizzazione della drum machine
 //   74      resync: beat of the bar line (0 = none)
 //   75      resync: request number (each one is sent once)
 //   76      resync: last request number sent (written here)
+//   84      SysEx (pattern change): request number
+//   85      SysEx: beat to send it at (0 = right away)
+//   86      SysEx: number of bytes (F0 ... F7, up to 16)
+//   87..102 SysEx: the bytes
+//   103     SysEx: last request number sent (written here)
+//
+// 3. Pattern changes: the bridge writes the SysEx for the machine; this sends it out of
+//    the track's MIDI output on the right sample (works on any REAPER version).
 
 options:gmem=MyLooper
 in_pin:L
@@ -33,6 +41,8 @@ GT = 64;
 g = 1;
 sent_seq = -1;
 MB = 0;          // 2 bytes for Stop + Start
+SX = 16;         // SysEx buffer
+sx_sent = gmem[GT + 20];   // a request left from before (old session, reload): already done
 
 @block
 running = (play_state & 1) ? 1 : 0;
@@ -59,6 +69,22 @@ running && rs_beat > 0 && rs_seq != sent_seq ? (
     gmem[GT + 12] = rs_seq;
   ) : beat_position >= rs_beat ? (
     sent_seq = rs_seq;                                     // missed it: never send it late
+  );
+);
+
+// SysEx: on its beat (or right away), once per request
+sx_seq = gmem[GT + 20];
+sx_seq > 0 && sx_seq != sx_sent ? (
+  sx_beat = gmem[GT + 21];
+  sx_off = sx_beat <= 0 || !running ? 0 : floor((sx_beat - beat_position) * 60 / tempo * srate);
+  sx_off < 0 ? sx_off = 0;                          // late: right away
+  sx_off < samplesblock ? (
+    sx_n = min(16, max(0, gmem[GT + 22]|0));
+    k = 0;
+    loop(sx_n, SX[k] = gmem[GT + 23 + k]; k += 1; );
+    sx_n > 0 ? midisend_buf(sx_off, SX, sx_n);
+    sx_sent = sx_seq;
+    gmem[GT + 39] = sx_seq;
   );
 );
 

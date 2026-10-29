@@ -20,7 +20,10 @@ html = html.replace(/<script[^>]*\ssrc="([^"]+\.js)"[^>]*><\/script>/g, (_, src)
 // would be expanded as replacement patterns and corrupt the JavaScript
 html = html.replace('</body>', () => `${scripts.join('')}</body>`);
 // icons / manifest are not needed on the iPad
-html = html.replace(/<link[^>]+rel="(icon|apple-touch-icon|manifest)"[^>]*>/g, '');
+// (the inline data: icons stay, so the iPad gets a favicon and a home screen icon)
+html = html.replace(/<link[^>]+rel="(icon|apple-touch-icon|manifest)"[^>]*>/g, (tag) =>
+  /href="data:/.test(tag) ? tag : ''
+);
 
 const out = path.join(buildDir, 'looper.html');
 fs.writeFileSync(out, html);

@@ -43,6 +43,7 @@ export const CMD = {
   SHOW_START: 214,
   SHOW_STOP: 215,
   SHOW_CONTINUE: 216,
+  SHOW_BACK: 219,   // bridge: the scaletta goes back one bar (redo the bar you are in)
   UNO_PATTERN: 217, // bridge: drum machine to pattern arg (1..100) right now
   UNO_SET: 218,     // bridge: pattern settings, arg = ofs + 2*lead (eighths)
   SYNTH_SAVE: 220,  // bridge: save the current sound of the synth as a preset
@@ -53,7 +54,7 @@ export const CMD = {
 export const ALL_LOOPERS = 0;
 
 // must match MyLooper.jsfx (gmem +11) and MyLooper_bridge.lua
-export const PROTO = 12;
+export const PROTO = 15;
 
 // Section states
 export const ST = { EMPTY: 0, STOPPED: 1, PLAYING: 2, RECORDING: 3, OVERDUB: 4 };
@@ -107,6 +108,7 @@ export const EV = {
   PATTERN: 16,   // v = pattern of the drum machine (1..100)
   STACCO: 17,    // v = stacArg(pos, dur, drum): silence inside the bar
   SYNTH: 18,     // v = id of the synth sound
+  CLEAR: 19,     // scarta: empties the section / the instrument / everything, on the bar
 };
 
 export const EV_INFO = {
@@ -128,6 +130,7 @@ export const EV_INFO = {
   [EV.PATTERN]: { icon: 'PAT', label: 'Pattern drum', cls: 'drum' },
   [EV.STACCO]: { icon: 'STC', label: 'Stacco', cls: 'stacco' },
   [EV.SYNTH]: { icon: 'SYN', label: 'Suono synth', cls: 'synth' },
+  [EV.CLEAR]: { icon: '✕', label: 'Scarta', cls: 'clear' },
 };
 
 // stacco: position and length in eighths (pos 0 = on the 1 of the bar), drum = the
@@ -136,9 +139,15 @@ export const EV_INFO = {
 export const fxEvArg = (val, bars = 0) => Math.round(val) + 256 * Math.round(Math.max(0, bars) * 4);
 export const fxEvParts = (v) => ({ val: v % 256, bars: Math.floor(v / 256) / 4 });
 
-export const stacArg = (pos, dur, drum = false) =>
-  Math.max(0, Math.min(63, Math.round(pos))) + 64 * Math.max(1, Math.min(63, Math.round(dur))) + (drum ? 4096 : 0);
-export const stacParts = (v) => ({ pos: v % 64, dur: Math.floor(v / 64) % 64, drum: Math.floor(v / 4096) % 2 === 1 });
+// who stops (Generale only): 'all' loopers + drum, 'loopers' only, 'drum' only
+export const stacArg = (pos, dur, who = 'loopers') =>
+  Math.max(0, Math.min(63, Math.round(pos))) + 64 * Math.max(1, Math.min(63, Math.round(dur))) +
+  (who === 'all' || who === true ? 4096 : 0) + (who === 'drum' ? 8192 : 0);
+export const stacParts = (v) => {
+  const drum = Math.floor(v / 4096) % 2 === 1;
+  const onlyDrum = Math.floor(v / 8192) % 2 === 1;
+  return { pos: v % 64, dur: Math.floor(v / 64) % 64, drum, onlyDrum, who: onlyDrum ? 'drum' : drum ? 'all' : 'loopers' };
+};
 // "1/8", "3/4", "1 bar"... for an eighth count, with the bar of this time signature
 export function eighthsLabel(n, barEighths = 8) {
   if (n % barEighths === 0) return `${n / barEighths} bar`;

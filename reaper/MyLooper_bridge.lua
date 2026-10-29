@@ -20,7 +20,7 @@ local EXT           = "MyLooper"   -- ExtState section (must match the web app)
 local MAX_LOOPERS   = 16
 local AUTO_TRANSPORT = true        -- start REAPER playback when a rec/play command arrives
 local SCAN_EVERY    = 1.0          -- seconds between track scans
-local PROTO         = 12            -- must match MyLooper.jsfx (gmem +11) and the web app
+local PROTO         = 15            -- must match MyLooper.jsfx (gmem +11) and the web app
 
 -- Drum machine: the "Drum" button on the iPad mutes / unmutes these tracks at the end of
 -- the bar, so the machine keeps running on the MIDI clock and comes back perfectly in sync.
@@ -109,6 +109,67 @@ local function isPlaying()
   return (reaper.GetPlayState() & 1) == 1
 end
 
+---------------------------------------------------------------- transport + tempo
+-- The drum machine follows REAPER's MIDI clock by COUNTING its ticks: it does not know
+-- where the bar is. So:
+-- 1. play always starts on a bar line, or the machine starts its pattern mid bar;
+-- 2. a tempo change while playing becomes a tempo marker on a bar line. Without it REAPER
+--    keeps the time and moves the beats under it: the click and the loops jump to the new
+--    grid, the machine (counting ticks) does not, and from there on it is off.
+--    The markers only live while it plays: when the transport stops they are removed and
+--    the tempo you were playing at becomes the project tempo.
+local tempoLive = { added = false, cur = nil, wasPlaying = false }
+
+local function playFromBar()
+  if isPlaying() then return end
+  local pos = reaper.GetCursorPosition()
+  local _, measures = reaper.TimeMap2_timeToBeats(0, pos)
+  local t0 = reaper.TimeMap2_beatsToTime(0, 0, measures)
+  if pos - t0 > 0.001 then reaper.SetEditCurPos(t0, false, false) end
+  reaper.OnPlayButton()
+end
+
+-- atQN: the bar it has to happen on (quarter notes from the start), nil = the next bar
+local function setTempo(bpm, atQN)
+  if not bpm or bpm <= 0 then return end
+  if not isPlaying() then reaper.SetCurrentBPM(0, bpm, false) return end
+  if reaper.CountTempoTimeSigMarkers(0) > 0 and not tempoLive.added then
+    reaper.SetCurrentBPM(0, bpm, false)       -- the project has its own tempo map: leave it alone
+    return
+  end
+  local t
+  if atQN then
+    t = reaper.TimeMap2_beatsToTime(0, atQN)
+  else
+    local _, measures = reaper.TimeMap2_timeToBeats(0, reaper.GetPlayPosition())
+    t = reaper.TimeMap2_beatsToTime(0, 0, measures + 1)
+  end
+  local idx = -1                               -- already a marker there? change that one
+  for i = 0, reaper.CountTempoTimeSigMarkers(0) - 1 do
+    local _, tp = reaper.GetTempoTimeSigMarker(0, i)
+    if math.abs(tp - t) < 0.001 then idx = i break end
+  end
+  reaper.SetTempoTimeSigMarker(0, idx, t, -1, -1, bpm, 0, 0, false)
+  reaper.UpdateTimeline()
+  tempoLive.added = true
+  tempoLive.cur = tempoLive.cur or reaper.Master_GetTempo()
+end
+
+local function runTempo()
+  local playing = isPlaying()
+  if playing and tempoLive.added then
+    tempoLive.cur = reaper.TimeMap_GetDividedBpmAtTime(reaper.GetPlayPosition())
+  end
+  if tempoLive.wasPlaying and not playing and tempoLive.added then
+    local bpm = tempoLive.cur
+    for i = reaper.CountTempoTimeSigMarkers(0) - 1, 0, -1 do reaper.DeleteTempoTimeSigMarker(0, i) end
+    tempoLive.added, tempoLive.cur = false, nil
+    if bpm and bpm > 0 then reaper.SetCurrentBPM(0, bpm, false) end
+    reaper.UpdateTimeline()
+  end
+  tempoLive.wasPlaying = playing
+end
+
 ---------------------------------------------------------------- drum machine
 -- The machine follows REAPER's MIDI clock, so it can't be "paused" on its own without
 -- losing the sync: instead its tracks are muted at the end of the bar. It keeps turning,
@@ -191,17 +252,7 @@ local function scanUno()
   end
 end
 
-local function sendPattern(n)
-  n = math.floor(n or 0)
-  if n < 1 or n > 100 then return end
-  if not reaper.SendMIDIMessageToHardware then uno.err = "REAPER troppo vecchio (manca SendMIDIMessageToHardware)" return end
-  if uno.dev < 0 then scanUno() end
-  if uno.dev < 0 then uno.err = "UNO Drum non trovata tra le uscite MIDI" return end
-  local b = n - unoSetting("uno_ofs", 0)
-  b = math.max(0, math.min(127, b))
-  reaper.SendMIDIMessageToHardware(uno.dev, string.char(0xF0, 0x00, 0x21, 0x1A, 0x02, 0x02, 0x35, 0x00, b, 0xF7))
-  uno.last, uno.sent, uno.err = n, uno.sent + 1, ""
-end
+local sendPattern   -- below, after the gate (it can go through it)
 
 ---------------------------------------------------------------- drum machine: stacchi
 -- A stacco on the drum needs to be sample accurate, so it is done by MyLooper_gate.jsfx
@@ -262,7 +313,7 @@ end
 -- track), so it restarts its pattern exactly on the 1. On a multiple of the pattern length,
 -- counted from the start of the project. Automatic after every dropout REAPER reports,
 -- or by hand (long press on Drum).
---   drum_sync_auto  1 = after a dropout (default), 0 = only by hand
+--   drum_sync_auto  1 = after a dropout, 0 = only by hand (default: the UNO has to be tried first)
 --   drum_patlen     length of the machine's pattern in bars (1, 2, 4, 8)
 local sync = { beat = 0, bar = 0, seq = 0, n = 0, miss = 0, xruns = 0, lastX = nil, prepared = {} }
 
@@ -290,8 +341,60 @@ local function midiOutOk()
   return tr and reaper.GetMediaTrackInfo_Value(tr, "I_MIDIHWOUT") >= 0
 end
 
+-- An older version pointed the drum track's MIDI output to the machine on its own, before
+-- anyone asked for a resync: undo that, until the resync is used by hand at least once.
+local cleanedMidiOut = false
+local function cleanDrumMidiOut()
+  if cleanedMidiOut or reaper.GetExtState(EXT, "drum_sync_used") == "1" then return end
+  local tr = drums.tracks[1]
+  if not tr or uno.dev < 0 then return end
+  cleanedMidiOut = true
+  if reaper.GetMediaTrackInfo_Value(tr, "I_MIDIHWOUT") == uno.dev * 32 then
+    reaper.SetMediaTrackInfo_Value(tr, "I_MIDIHWOUT", -1)
+  end
+end
+
+-- Pattern change. Two ways to the machine:
+--  - through MyLooper_gate.jsfx on the first drum track (its MIDI output goes to the
+--    machine): on the exact beat, and on any REAPER version. Used when it is ready.
+--  - SendMIDIMessageToHardware, right away (needs a recent REAPER).
+-- beat: when it has to arrive (quarter notes), nil = now.
+local function gateMidiReady()
+  local tr = drums.tracks[1]
+  return tr and uno.dev >= 0 and gateAlive(reaper.time_precise())
+    and reaper.GetMediaTrackInfo_Value(tr, "I_MIDIHWOUT") == uno.dev * 32
+end
+
+local sxSeq = 0
+sendPattern = function(n, beat)
+  n = math.floor(n or 0)
+  if n < 1 or n > 100 then return end
+  if uno.dev < 0 then scanUno() end
+  if uno.dev < 0 then uno.err = "UNO Drum non trovata tra le uscite MIDI" return end
+  reaper.SetExtState(EXT, "drum_sync_used", "1", true)   -- keep the MIDI output we set
+  prepareDrumSync(false)
+  local b = math.max(0, math.min(127, n - unoSetting("uno_ofs", 0)))
+  local msg = { 0xF0, 0x00, 0x21, 0x1A, 0x02, 0x02, 0x35, 0x00, b, 0xF7 }
+  if gateMidiReady() then
+    sxSeq = math.max(sxSeq, reaper.gmem_read(GATE + 20)) + 1
+    reaper.gmem_write(GATE + 22, #msg)
+    for k, v in ipairs(msg) do reaper.gmem_write(GATE + 22 + k, v) end
+    reaper.gmem_write(GATE + 21, beat or 0)
+    reaper.gmem_write(GATE + 20, sxSeq)              -- request number last: never half written
+    uno.route = "gate"
+  elseif reaper.SendMIDIMessageToHardware then
+    reaper.SendMIDIMessageToHardware(uno.dev, string.char(table.unpack(msg)))
+    uno.route = "api"
+  else
+    uno.err = "Non riesco a mandarlo: manca il gate sulla traccia drum e REAPER e' troppo vecchio"
+    return
+  end
+  uno.last, uno.sent, uno.err = n, uno.sent + 1, ""
+end
+
 local function requestResync()
   if #drums.tracks == 0 or not isPlaying() then return end
+  reaper.SetExtState(EXT, "drum_sync_used", "1", true)
   prepareDrumSync(true)
   local len = math.max(1, math.floor(syncSetting("drum_patlen", 1)))
   local pos = reaper.GetPlayPosition()
@@ -321,7 +424,7 @@ local function runSync()
     local key = tostring(a) .. ":" .. tostring(md)
     if sync.lastX and key ~= sync.lastX and isPlaying() then
       sync.xruns = sync.xruns + 1
-      if syncSetting("drum_sync_auto", 1) == 1 and sync.beat == 0 and drums.mute == 0 then requestResync() end
+      if syncSetting("drum_sync_auto", 0) == 1 and sync.beat == 0 and drums.mute == 0 then requestResync() end
     end
     sync.lastX = key
   end
@@ -731,7 +834,7 @@ local function loadJob(slot)
   local tempo = tonumber(m.tempo)
   local note = ""
   if tempo and math.abs(tempo - reaper.Master_GetTempo()) > 0.01 then
-    reaper.SetCurrentBPM(0, tempo, true)
+    setTempo(tempo)
     note = " (tempo riportato a " .. string.format("%g", tempo) .. " BPM)"
   end
   -- saved looper -> current looper: same track name first, otherwise same position
@@ -956,18 +1059,22 @@ end
 
 local function startShow()
   if not show then return end
-  if not isPlaying() then reaper.OnPlayButton() end
+  local wasPlaying = isPlaying()
+  if not wasPlaying then
+    if show.tempo and show.tempo > 0 then reaper.SetCurrentBPM(0, show.tempo, false) end
+    playFromBar()
+  end
   local bar = barQN()
   local now = nowQN()
   local start = nextBarQN()
   -- se la stanghetta e' proprio adesso non c'e' il tempo di prenotare: la successiva
   if start - now < bar * 0.25 then start = start + bar end
   run = { state = 1, start = start, paused = 0, bar = bar, fired = {}, booked = {},
-          check = {}, nbook = 0, ndone = 0, nfall = 0 }
-  if show.tempo and show.tempo > 0 then reaper.SetCurrentBPM(0, show.tempo, false) end
+          check = {}, nbook = 0, ndone = 0, nfall = 0, newTake = {}, redo = {}, back = 0, backUntil = 0 }
+  if wasPlaying and show.tempo and show.tempo > 0 then setTempo(show.tempo, start) end
   -- uno stacco anche sulla drum? serve il gate sulle sue tracce
   for _, e in ipairs(show.events) do
-    if e.t == 17 and e.l == 0 and math.floor(e.v / 4096) % 2 == 1 then ensureGate() break end
+    if e.t == 17 and e.l == 0 and math.floor(e.v / 4096) % 4 > 0 then ensureGate() break end
   end
 end
 
@@ -987,6 +1094,44 @@ local function stopShow()
   run = { state = 0 }
 end
 
+-- Indietro: the scaletta goes back one bar (pressed twice in the same bar: two bars...).
+-- From the next bar line it plays again the bar you are in, so a rec you forgot to play
+-- is done again (a new take starts over, see act 5 / 6 of the JSFX). What was booked in
+-- the JSFX for the next bar is cancelled; fades, filter and EQ already done stay as they are.
+local REDO = { [1] = true, [2] = true, [3] = true, [4] = true, [11] = true, [12] = true, [14] = true,
+               [15] = true, [16] = true, [17] = true, [18] = true, [19] = true }
+local function rewindShow()
+  if run.state ~= 1 or not show then return end
+  local now = nowQN()
+  local cur = math.floor((now - run.start - run.paused) / run.bar) + 1
+  if cur < 1 then return end
+  for key in pairs(run.booked or {}) do
+    local id, sc = key:match("^(%d+):(%d+)$")
+    if id then push(tonumber(id), 28, tonumber(sc)) end      -- act 0 = cancel
+  end
+  run.booked = {}
+  if run.nstk and run.nstk > 0 then
+    for _, l in ipairs(loopers) do push(l.id, 31, 8) end
+    gateClear()
+  end
+  for i, e in ipairs(show.events) do
+    if e.bar >= cur and run.fired[i] and REDO[e.t] and not (e.t == 11 and e.v == 2) then
+      run.fired[i] = nil
+      run.redo[i] = true
+      if run.clr then run.clr[i] = nil end
+    end
+  end
+  for k = #run.check, 1, -1 do
+    if run.check[k].e.bar >= cur then table.remove(run.check, k) end
+  end
+  run.paused = run.paused + run.bar
+  -- how many times in this bar (for the iPad): until the next bar line
+  local nextLine = run.start + run.paused + cur * run.bar - run.bar
+  if now >= (run.backUntil or 0) then run.back = 0 end
+  run.back = (run.back or 0) + 1
+  run.backUntil = nextLine
+end
+
 local function continueShow()
   if run.state ~= 2 then return end
   run.paused = run.paused + (nextBarQN() - run.holdAt)
@@ -998,6 +1143,34 @@ end
 -- normale. Meglio un pelo in ritardo che niente.
 -- tipo di evento della scaletta -> azione prenotata nel JSFX (comando 28)
 local SCHED_ACT = { [1] = 3, [2] = 2, [3] = 1, [4] = 4 }
+
+-- how long a rec of the scaletta lasts: from its bar to the play / pause of the same section
+-- after it (or play all / stop all of its instrument). nil = not closed by the scaletta.
+local function recBars(i)
+  local e = show.events[i]
+  for j = i + 1, #show.events do
+    local f = show.events[j]
+    if f.bar > e.bar and f.l == e.l and
+       ((f.s == e.s and (f.t == 2 or f.t == 3)) or (f.s < 0 and (f.t == 14 or f.t == 15))) then
+      return f.bar - e.bar
+    end
+  end
+  return nil
+end
+
+-- a rec of this section on this bar? / a "Scarta" that hits this section on this bar?
+local function recAt(id, sc, bar)
+  for _, f in ipairs(show.events) do
+    if f.bar == bar and (f.t == 1 or f.t == 4) and f.l == id and f.s == sc then return true end
+  end
+  return false
+end
+local function clearAt(id, sc, bar)
+  for _, f in ipairs(show.events) do
+    if f.bar == bar and f.t == 19 and (f.l == 0 or (f.l == id and (f.s < 0 or f.s == sc))) then return true end
+  end
+  return false
+end
 
 local function gsec(id, s, off) return reaper.gmem_read(id * 1024 + 16 + s * 12 + (off or 0)) end
 local function looperVer(id) return reaper.gmem_read(id * 1024 + 11) end
@@ -1058,7 +1231,7 @@ local function fireEvent(e)
   elseif e.t == 11 then
     if e.v == 2 or (e.v == 0) ~= (drums.mute == 1) then toggleDrums() end
   elseif e.t == 12 then
-    if e.v > 0 then reaper.SetCurrentBPM(0, e.v / 100, false) end
+    if e.v > 0 then setTempo(e.v / 100, eventQN(e)) end
   elseif e.t == 14 then
     push(e.l, 3, 0)
   elseif e.t == 15 then
@@ -1076,13 +1249,14 @@ local function bookStacco(e, at)
   local pos = e.v % 64
   local dur = math.floor(e.v / 64) % 64
   local withDrum = math.floor(e.v / 4096) % 2 == 1
+  local onlyDrum = math.floor(e.v / 8192) % 2 == 1        -- Generale: the loopers keep playing
   if dur < 1 then return end
   local a = at + pos * 0.5
   local b = a + dur * 0.5
   local arg = 16 * (dur * 2 + 1024 * math.floor(a * 4 + 0.5))
   if e.l == 0 then
-    for _, l in ipairs(loopers) do push(l.id, 31, 8 + arg) end
-    if withDrum then gateWindow(a, b) end
+    if not onlyDrum then for _, l in ipairs(loopers) do push(l.id, 31, 8 + arg) end end
+    if withDrum or onlyDrum then gateWindow(a, b) end
   elseif e.s < 0 then
     push(e.l, 31, 8 + arg)
   else
@@ -1134,7 +1308,24 @@ local function runShow()
           -- the JSFX fires it on the exact beat: s + 8*act + 64*(beat*2).
           -- ATTENZIONE: i tipi della scaletta (1 rec, 2 play, 3 pausa, 4 rec in cuffia)
           -- NON sono le azioni del JSFX (1 pausa, 2 play, 3 rec, 4 rec in cuffia).
-          push(e.l, 28, e.s + 8 * SCHED_ACT[e.t] + 64 * math.floor(at * 2 + 0.5))
+          local act = SCHED_ACT[e.t]
+          -- the first time: remember if this rec makes a new take (section empty / paused)
+          if run.newTake[i] == nil then run.newTake[i] = gsec(e.l, e.s) <= 1 end
+          -- went back to redo it: a new take starts over (5 / 6), an overdub just overdubs again
+          -- (a "Scarta" on the same bar = the rec replaces what was there: a new take as well)
+          local scarta = (e.t == 1 or e.t == 4) and clearAt(e.l, e.s, e.bar)
+          if ((run.redo[i] and run.newTake[i]) or scarta) and (e.t == 1 or e.t == 4) and looperVer(e.l) >= 13 then
+            act = (e.t == 1) and 5 or 6
+          end
+          -- the take lasts as long as the scaletta says, not the rec length of the looper
+          if e.t == 1 or e.t == 4 then
+            local nb = recBars(i)
+            local tsn = reaper.gmem_read(e.l * 1024 + 5)
+            if nb and looperVer(e.l) >= 14 then
+              push(e.l, 33, e.s + 8 * math.floor(nb * (tsn > 0 and tsn or 4) * 2 + 0.5))
+            end
+          end
+          push(e.l, 28, e.s + 8 * act + 64 * math.floor(at * 2 + 0.5))
           run.booked[key] = i
           run.nbook = (run.nbook or 0) + 1
         end
@@ -1149,16 +1340,57 @@ local function runShow()
             run.nfall = (run.nfall or 0) + 1
           end
         end
+      elseif e.t == 19 then                 -- scarta: booked in the JSFX on the beat (act 7)
+        local ids = {}
+        if e.l == 0 then for _, l in ipairs(loopers) do ids[#ids + 1] = l.id end else ids[1] = e.l end
+        local targets = {}
+        for _, id in ipairs(ids) do
+          if e.l ~= 0 and e.s >= 0 then targets[#targets + 1] = { id, e.s }
+          else for sc = 0, 7 do targets[#targets + 1] = { id, sc } end end
+        end
+        run.clr = run.clr or {}
+        run.clr[i] = run.clr[i] or {}
+        local done = run.clr[i]
+        if at <= now + lookahead then
+          for _, t in ipairs(targets) do
+            local id, sc = t[1], t[2]
+            local key = id .. ":" .. sc
+            -- a rec on the same bar takes its place (it starts a new take anyway)
+            if not done[key] and not recAt(id, sc, e.bar) and looperVer(id) >= 15 and not run.booked[key] then
+              push(id, 28, sc + 8 * 7 + 64 * math.floor(at * 2 + 0.5))
+              run.booked[key] = i
+              done[key] = true
+              run.nbook = (run.nbook or 0) + 1
+            end
+          end
+        end
+        if now >= at then
+          for _, t in ipairs(targets) do
+            local id, sc = t[1], t[2]
+            local key = id .. ":" .. sc
+            if not done[key] and not recAt(id, sc, e.bar) then push(id, 9, sc); done[key] = true end
+            if run.booked[key] == i then run.booked[key] = nil end
+          end
+          run.fired[i] = true
+          run.ndone = (run.ndone or 0) + 1
+        end
       elseif e.t == 17 then                 -- stacco: booked a bar ahead, the JSFX does the rest
         if at <= now + lookahead then
           run.fired[i] = true
           run.ndone = (run.ndone or 0) + 1
           bookStacco(e, at)
         end
-      elseif e.t == 16 then                 -- pattern: sent a bit early if so set
-        if now >= at - unoSetting("uno_lead", 0) * 0.5 then
+      elseif e.t == 12 then                 -- tempo: a marker on its bar, set half a bar before
+        if now >= at - run.bar * 0.5 then
           run.fired[i] = true
           fireEvent(e)
+        end
+      elseif e.t == 16 then                 -- pattern: sent a bit early if so set
+        local leadQN = unoSetting("uno_lead", 0) * 0.5
+        local via = gateMidiReady()           -- through the gate: handed over half a bar before
+        if now >= at - leadQN - (via and run.bar * 0.5 or 0) then
+          run.fired[i] = true
+          sendPattern(e.v, via and (at - leadQN) or nil)
         end
       elseif now >= at then
         run.fired[i] = true
@@ -1195,16 +1427,18 @@ local function showState()
   local ver = 99
   for _, l in ipairs(loopers) do ver = math.min(ver, looperVer(l.id)) end
   if ver == 99 then ver = 0 end
-  return string.format('{"st":%d,"bar":%d,"name":%s,"bars":%d,"n":%d,"next":%s,' ..
+  local back = 0
+  if run.state > 0 and (run.back or 0) > 0 and nowQN() < (run.backUntil or 0) then back = run.back end
+  return string.format('{"st":%d,"bar":%d,"back":%d,"name":%s,"bars":%d,"n":%d,"next":%s,' ..
     '"ver":%d,"book":%d,"done":%d,"fall":%d,"slots":[%s]}',
-    run.state, bar, jsonStr(show and show.name or ""), show and show.bars or 0,
+    run.state, bar, back, jsonStr(show and show.name or ""), show and show.bars or 0,
     show and #show.events or 0, jsonStr(nextTxt),
     ver, run.nbook or 0, run.ndone or 0, run.nfall or 0, table.concat(slots, ","))
 end
 
 local function handle(target, code, arg)
   if code == 100 then                        -- REAPER transport play/stop
-    if isPlaying() then reaper.OnStopButton() else reaper.OnPlayButton() end
+    if isPlaying() then reaper.OnStopButton() else playFromBar() end
     return
   end
   if code == 200 then startJob("save", arg) return end
@@ -1227,6 +1461,7 @@ local function handle(target, code, arg)
   if code == 214 then startShow() return end
   if code == 215 then stopShow() return end
   if code == 216 then continueShow() return end
+  if code == 219 then rewindShow() return end          -- scaletta: back one bar
   if code == 217 then sendPattern(arg) return end
   if code == 220 then saveSound() return end           -- synth: save the current sound
   if code == 221 then loadSound(arg) return end        -- synth: load sound id
@@ -1237,7 +1472,7 @@ local function handle(target, code, arg)
     return
   end
   if AUTO_TRANSPORT and (code == 1 or code == 2 or code == 3) and not isPlaying() then
-    reaper.OnPlayButton()
+    playFromBar()
   end
   for _, l in ipairs(loopers) do
     if target == 0 or target == l.id then push(l.id, code, arg) end
@@ -1313,13 +1548,14 @@ local function buildState(now)
   end
 
   local syncJson = string.format('{"bar":%d,"auto":%d,"len":%d,"x":%d,"n":%d,"miss":%d,"out":%d}',
-    sync.bar, syncSetting("drum_sync_auto", 1), syncSetting("drum_patlen", 1), sync.xruns, sync.n, sync.miss,
+    sync.bar, syncSetting("drum_sync_auto", 0), syncSetting("drum_patlen", 1), sync.xruns, sync.n, sync.miss,
     midiOutOk() and 1 or 0)
   local drumsJson = string.format('{"n":%d,"mute":%d,"pend":%d,"gate":%d,"sync":%s,' ..
-    '"uno":{"dev":%d,"name":%s,"last":%d,"sent":%d,"err":%s,"ofs":%d,"lead":%d,"api":%d}}',
+    '"uno":{"dev":%d,"name":%s,"last":%d,"sent":%d,"err":%s,"ofs":%d,"lead":%d,"api":%d,"route":%s}}',
     #drums.tracks, drums.mute, drums.want, gateAlive(now) and 1 or 0, syncJson,
     uno.dev, jsonStr(uno.name), uno.last, uno.sent, jsonStr(uno.err),
-    unoSetting("uno_ofs", 0), unoSetting("uno_lead", 0), reaper.SendMIDIMessageToHardware and 1 or 0)
+    unoSetting("uno_ofs", 0), unoSetting("uno_lead", 0), reaper.SendMIDIMessageToHardware and 1 or 0,
+    jsonStr(uno.route or ""))
 
   return string.format(
     '{"t":%d,"proto":%d,"sess":%s,"ack":%d,"playing":%s,"tempo":%s,"loopers":[%s],"mem":[%s],' ..
@@ -1339,12 +1575,13 @@ local function step()
     scanDrums()
     scanUno()
     scanSynth()
-    if not isPlaying() then prepareDrumSync(false) end   -- gate + MIDI out ready before playing
+    cleanDrumMidiOut()
     if now - synth.listAt > 10 then refreshSynthList(now) end
     if not job or job.done then refreshSlots(); refreshShowSlots() end
     lastScan = now
   end
   readCommands()
+  runTempo()
   runDrums()
   runSync()
   runShow()

@@ -101,6 +101,15 @@ Non serve nessun server esterno: la pagina la serve REAPER, lo script Lua fa da 
   - eventi: **rec**, **rec in cuffia**, **play**, **pausa**, **play/stop di tutte** le sezioni di uno strumento,
     **fade in / out** (con la loro lunghezza), **filtro** e **bassi/medi/alti**, **drum machine** in play o in pausa,
     **cambio di BPM**, e **attesa**.
+  - una **rec** dura dalla sua bar fino al **play / pausa** dopo di lei sulla stessa sezione (o play/stop di tutte
+    del suo strumento): rec alla bar 2 e play alla 4 = take da 2 bar, qualunque sia la lunghezza di rec impostata
+    sullo strumento. Se nessun play/pausa la chiude, vale la lunghezza dello strumento.
+  - **scarta**: svuota la sezione (o tutto lo strumento, o su *Generale* tutto) esattamente sulla stanghetta, per
+    registrarci sopra qualcos'altro più avanti. Se sulla stessa bar c'è una rec di quella sezione, vince la rec (parte
+    una take nuova che sostituisce la vecchia). In alto c'è anche **Svuota tutto** (tieni premuto) per ripartire da
+    zero senza uscire dalla scaletta.
+  - stacco su *Generale*: scegli **chi si ferma**: tutti, solo i looper o **solo la drum** (es. la drum tace sul 4 e
+    rientra sull'1). Durate fino a 4 bar.
   - **attesa**: la scaletta arriva lì, tiene tutto com'è e riparte solo quando tocchi *Continua*. Mettine una dove
     vuoi allungare un giro o aspettare il pubblico: tutto quello che viene dopo si sposta in avanti di conseguenza.
   - **Avvia** fa partire la scaletta dalla **prossima stanghetta** e conta le bar da lì; sopra vedi la bar corrente
@@ -114,8 +123,9 @@ Non serve nessun server esterno: la pagina la serve REAPER, lo script Lua fa da 
     *tutto* di uno strumento tace lo strumento, su *Generale* tacciono tutti i looper e (con la spunta) anche la
     drum machine. È prenotato nel JSFX al campione, con una rampa di 4 ms per non fare click. Per la drum serve
     `MyLooper_gate.jsfx` sulle sue tracce: lo script lo aggiunge da solo alla prima scaletta che ne ha bisogno.
-  - **pattern drum** (su *Generale*): manda alla UNO Drum il cambio di pattern (SysEx sulla sua uscita MIDI,
-    `F0 00 21 1A 02 02 35 00 <n> F7`). Nel riquadro *Drum machine* sotto la griglia puoi provare un pattern al volo,
+  - **pattern drum** (su *Generale*): manda alla UNO Drum il cambio di pattern (SysEx
+    `F0 00 21 1A 02 02 35 00 <n> F7`). Passa dal gate della prima traccia drum (la sua uscita MIDI va alla UNO: lo
+    script la imposta da solo la prima volta), sul beat giusto; se il gate non c'è ancora, direttamente. Nel riquadro *Drum machine* sotto la griglia puoi provare un pattern al volo,
     correggere la numerazione se arriva a quello dopo, e scegliere se mandare il cambio sulla stanghetta o un po'
     prima (se la UNO aspetta la fine del suo pattern prima di cambiare).
   - **filtro / bassi / medi / alti** con **transizione**: dopo il valore scegli *Subito* oppure *in ½ … 32 bar*,
@@ -126,7 +136,19 @@ Non serve nessun server esterno: la pagina la serve REAPER, lo script Lua fa da 
     Splice e tocchi **Salva il suono attuale** (il nome lo prende dallo strumento), poi lo trovi nell'elenco della
     scaletta. Da lì puoi anche caricarli a mano o toglierli. Cambia solo il plugin: il looper sulla stessa traccia non
     si tocca. Il cambio carica dei campioni, quindi mettilo dove il synth non suona.
+  - mentre gira, sotto l'header c'è una **striscia** con la bar, **Indietro**, *Continua* (alle attese) e **Ferma**:
+    non serve riaprire la finestra.
+  - **Indietro**: dalla prossima stanghetta la scaletta ripete la bar in cui sei (premuto 2 volte: torna indietro
+    di 2 bar, e così via). Serve se sbagli: ti dimentichi di suonare durante una rec, premi Indietro e la rec si
+    rifà da capo (la take nuova sostituisce quella vuota; un overdub invece si rifà sopra). Quello che era
+    prenotato per la bar dopo viene annullato e tutto il resto della scaletta slitta. Fade, filtri ed EQ già
+    partiti restano come sono.
   - mentre gira puoi sempre intervenire a mano con i pulsanti: la scaletta non blocca niente.
+- **Drum e tempo**: la UNO segue il MIDI clock *contando i tick*, non sa dov'è la bar. Per questo il Play dall'iPad
+  (e quello automatico) riparte sempre dall'inizio della bar, e un cambio di BPM fatto mentre suona (scaletta,
+  memorie) diventa un marker di tempo su una stanghetta: così la griglia non salta sotto i piedi della drum. I
+  marker esistono solo mentre suona: allo Stop vengono tolti e il progetto resta al tempo a cui stavi suonando.
+  Se cambi il BPM a mano in REAPER mentre suona, la drum va fuori: fallo a trasporto fermo.
 - **Drum a tempo**: se REAPER ha un buco audio la drum machine può perdere dei tick del MIDI clock e finire fuori
   dalla bar. *Tieni premuto Drum* (o *Rimettila a tempo* nel riquadro Drum machine della scaletta): alla prossima
   bar utile `MyLooper_gate.jsfx` manda alla UNO Stop + Start mezzo tick prima della stanghetta, così riparte il
@@ -158,3 +180,8 @@ allineate). Se è fermo, il primo rec o play lo avvia da solo (`AUTO_TRANSPORT` 
 - `npm run build:reaper`: genera `build/looper.html`. `npm run deploy` genera e copia.
 
 Protocollo (codici comando, layout gmem): vedi l'intestazione di `reaper/MyLooper.jsfx` e `src/lib/protocol.js`.
+
+## Licenza
+
+[MIT](LICENSE) © 2026 Antonio Zuccon Ghiotto. Fanno eccezione `super8.jsfx` e `super8_bar_1.jsfx`, basati su Super8 di
+Cockos Inc e rilasciati sotto GNU LGPL v2 o successiva (vedi la loro intestazione).

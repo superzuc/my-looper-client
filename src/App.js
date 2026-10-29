@@ -5,6 +5,7 @@ import LooperPage from './components/LooperPage';
 import MemoryPanel from './components/MemoryPanel';
 import FxPanel from './components/FxPanel';
 import ShowPanel from './components/ShowPanel';
+import ShowStrip from './components/ShowStrip';
 import GridView from './components/GridView';
 import { isDemo, useLooper } from './hooks/useLooper';
 import { ALL_LOOPERS, PROTO } from './lib/protocol';
@@ -43,6 +44,12 @@ function Notice({ conn, state }) {
       <div className="notice">
         <strong>Bridge non attivo.</strong> In REAPER esegui lo script <code>MyLooper_bridge.lua</code>{' '}
         (Actions → Load ReaScript).
+      </div>
+    );
+  if (state && !state.demo && state.proto > PROTO)
+    return (
+      <div className="notice">
+        <strong>La pagina è più vecchia del bridge.</strong> Ricaricala (su iPad: chiudi la scheda e riaprila).
       </div>
     );
   if (state && !state.demo && state.proto !== PROTO)
@@ -167,6 +174,7 @@ export default function App() {
         showOn={!!(state?.show && state.show.st > 0)}
       />
       <Notice conn={conn} state={state} />
+      <ShowStrip show={state?.show} send={send} onOpen={() => setShowOpen(true)} />
 
       {grid ? (
         <GridView

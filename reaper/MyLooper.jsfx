@@ -31,7 +31,7 @@ desc:MyLooper - 8-section tempo-synced looper, controlled from iPad (inspired by
 // Looper ID = order of the track in the project). Layout per looper, base = ID*1024:
 //   +0 heartbeat  +1 rec length (beats)  +2 mode  +3 rec-grid pos (0..1)  +4 running
 //   +5 ts_num  +6 rec length (secs)  +7 monitor  +8 can double  +9 ts_denom
-//   +10 max loop length (secs)  +11 protocol version (12)
+//   +10 max loop length (secs)  +11 protocol version (15)
 //   +12 undo section (-1 = none)  +13 undo state (0 none, 1 undo, 2 redo)
 //   +112..115 looper filter, low, mid, high   +116 fade kind (1 out, 2 in)
 //   +120+s*6: filter, low, mid, high, fade gain, fade kind  (per section)
@@ -56,13 +56,18 @@ desc:MyLooper - 8-section tempo-synced looper, controlled from iPad (inspired by
 //   25 section filter(s + 8*(0..200))     26 section EQ(s + 8*(band + 3*gain))
 //   27 reset filter+EQ (0 = looper, 1+s = section, 9 = everything)
 //   28 book an action for an exact beat (scaletta):
-//      s + 8*act + 64*(beat*2), act 1 = pause, 2 = play, 3 = rec, 4 = silent rec
+//      s + 8*act + 64*(beat*2), act 1 = pause, 2 = play, 3 = rec, 4 = silent rec,
+//      5 / 6 = rec / silent rec AGAIN (the scaletta went back): the take starts over
+//      7 = clear the section (scaletta "Scarta")
 //      (act 0 cancels what was booked for that section)
 //   30 set the length of one section (s + 8*(beats*2))
 //   31 stacco (scaletta): silence for a window of the timeline, the loops keep
 //      running underneath and come back in phase. arg = t + 16*(dur*4 + 1024*(beat*4)),
 //      t = section 0..7 or 8 = whole looper, beat / dur in quarter notes (1/16 steps).
 //      dur 0 = cancel. Two windows per section can be booked at once.
+//   33 length of the take the scaletta has booked for a section: s + 8*(beats*2)
+//      (the rec lasts from its bar to the play / pause after it, whatever the rec
+//      length of the looper says). 0 = none. Cleared by the booking cancel (28 act 0).
 //   32 filter / EQ transition (scaletta): arg = t + 16*(kind + 4*(val + 256*(dur*4 + 1024*beat*4)))
 //      t = section 0..7 or 8 = looper bus, kind 0 filter 1 low 2 mid 3 high, val 0..200
 //      (as in 23..26), from beat for dur quarter notes. Moving that knob by hand stops it.
@@ -175,7 +180,8 @@ RFROM = SECMEM + 460; // value when it started (0..200)
 RTO = SECMEM + 496;   // where it goes
 RB0 = SECMEM + 532;   // from this beat
 RB1 = SECMEM + 568;   // to this beat
-SECEND = SECMEM + 604;
+TAKEB = SECMEM + 604; // length (beats) of the booked take, 0 = the rec length of the looper
+SECEND = SECMEM + 612;
 XF = 18432;           // gmem audio transfer area
 
 ext_noinit == 0 ? (
@@ -363,20 +369,23 @@ function exec(s, act, d) local(st)
       retro(s, d, 1);                     // overdub on top of what is playing
       STATE[s] = 4;
     ) : st <= 1 ? (
-      undo_begin(s, len, d);
+      // new take: gets the current rec length, or the length the scaletta booked
+      tk_b = sch_take > 0 ? sch_take : cur_beats();
+      tk_n = sch_take > 0 ? beats_to_len(sch_take) : len;
+      undo_begin(s, tk_n, d);
       CUEF[s] ? cue_rec = 1;              // silent rec: monitor moves to the cue bus now
-      SBEATS[s] = cur_beats();            // new take: gets the current rec length
+      SBEATS[s] = tk_b;
       CBEATS[s] = SBEATS[s];
-      SLEN[s] = len;
+      SLEN[s] = tk_n;
       // the take started d samples ago: that is where its loop starts from now on
-      ph_q = cur_beats() * 4 / ts_denom;
+      ph_q = tk_b * 4 / ts_denom;
       ph = now_qn() - d / srate * tempo / 60;
       ph_k = floor(ph / ph_q + 0.5);
       abs(ph - ph_k * ph_q) < 0.01 ? ph = ph_k * ph_q;   // on the grid: keep it exact
       SPHB[s] = ph;
-      SPOS[s] = min(d|0, len - 1);
+      SPOS[s] = min(d|0, tk_n - 1);
       retro(s, d, 0);
-      FRESH[s] = len - min(d|0, len);
+      FRESH[s] = tk_n - min(d|0, tk_n);
       STATE[s] = 3;
       VALID[s] = 1;
     );
@@ -715,7 +724,7 @@ function sec_set_beats(s, b) local(nl, ol, cl, bl, br, n)
 // tight as playing it by hand (the late-press correction does the rest).
 function sched_sec(s, act, beat)
 (
-  act ? ( SCHA[s] = act; SCHB[s] = beat; ) : ( SCHA[s] = 0; );
+  act ? ( SCHA[s] = act; SCHB[s] = beat; ) : ( SCHA[s] = 0; TAKEB[s] = 0; );
 );
 
 // stacco: a window where the section is silent. It only gates the output, the loop
@@ -789,6 +798,7 @@ function handle(c, raw) local(a, v)
   c == 26 ? ( ramp_stop(a * 4 + 1 + v % 3); set_sec_eq(a, v % 3, floor(v / 3)); ) :
   c == 27 ? ( memset(RST, 0, 36); fx_reset(raw); ) :
   c == 32 ? fx_ramp(raw) :
+  c == 33 ? ( TAKEB[a] = v / 2; ) :
   c == 28 ? sched_sec(a, v % 8, floor(v / 8) / 2) :
   c == 30 ? sec_set_beats(a, v / 2) :
   c == 31 ? stacco(raw) :
@@ -885,7 +895,7 @@ looper_id >= 1 ? (
   gmem[GB + 8] = floor(cur_beats() * 2 * spb + 0.5) <= MAXLEN;
   gmem[GB + 9] = ts_denom;
   gmem[GB + 10] = MAXLEN / srate;
-  gmem[GB + 11] = 12;                      // protocol version (bridge/UI check it)
+  gmem[GB + 11] = 15;                      // protocol version (bridge/UI check it)
   gmem[GB + 12] = usec;
   gmem[GB + 13] = usec >= 0 ? (ustate == 2 ? 2 : 1) : 0;
   s = 0;
@@ -931,16 +941,23 @@ running ? (
       sch_a = SCHA[s];
       SCHA[s] = 0;
       PEND[s] = 0;
+      // retake: the scaletta went back to redo this rec, so the take starts over
+      // (a new take replaces the one that was recording / playing)
+      sch_a == 5 || sch_a == 6 ? ( STATE[s] = min(STATE[s], 1); sch_a -= 2; );
       sch_a == 4 ? ( STATE[s] < 2 ? ( CUEF[s] = 1; RECPAUSE[s] = 1; ); );
       // A new take starts exactly on the booked beat and remembers it as the start
       // of its loop (SPHB), so nothing is rotated. On a section that is already
       // looping, the late-press correction only makes sense right after its own
       // loop start: anywhere else it would touch the wrong cells, so d = 0.
       sch_new = (sch_a == 3 || sch_a == 4) && STATE[s] <= 1;
-      sch_dd = sch_new ? sch_d : (SPOS[s] < sch_d ? SPOS[s] : 0);
+      sch_dd = sch_new ? sch_d : (SPOS[s] <= sch_d ? SPOS[s] : 0);
+      sch_take = TAKEB[s];                // the length the scaletta wants for this take
+      TAKEB[s] = 0;
+      sch_a == 7 ? clear_sec(s) :
       sch_a == 3 || sch_a == 4 ? exec(s, 3, sch_dd) :
       sch_a == 2 ? exec(s, 2, sch_dd) :
       sch_a == 1 ? exec(s, 1, sch_dd);
+      sch_take = 0;
     );
     s += 1;
   );

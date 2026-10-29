@@ -6,7 +6,7 @@ const GRACE_S = 0.15;
 
 function makeLooper(id, name, color, beats) {
   return {
-    id, name, color, alive: true, ver: 12, beats, mode: 1, pos: 0, running: 1,
+    id, name, color, alive: true, ver: 15, beats, mode: 1, pos: 0, running: 1,
     fade: 0, fadeK: 0, fadeG: 1, fadeB0: 0, fadeB1: 0,
     fil: 0, lo: 1, mid: 1, hi: 1,
     tsNum: 4, tsDenom: 4, lenSec: 0, mon: 1, canDouble: 1, maxSec: 40,
@@ -50,7 +50,7 @@ export class DemoClient {
     this.mem[0] = { slot: 1, saved: '21/09 22:14', n: 3, tempo: '96' };
     this.job = null;
     this.saved = {};
-    this.drums = { n: 2, mute: 0, pend: -1, gate: 1, sync: { bar: 0, auto: 1, len: 1, x: 0, n: 0, miss: 0, out: 1 } };
+    this.drums = { n: 2, mute: 0, pend: -1, gate: 1, sync: { bar: 0, auto: 0, len: 1, x: 0, n: 0, miss: 0, out: 1 } };
     this.synth = {
       ok: 1, fx: 'Splice INSTRUMENT (Splice)', cur: 'Piano Granular (Opia)', msg: '',
       list: [{ id: 1, name: 'Piano Granular (Opia)' }, { id: 2, name: 'Granular Choir (Astral Forms)' }],
@@ -108,6 +108,14 @@ export class DemoClient {
         return;
       }
       if (e.t === EV.STACCO) return; // in the demo there is no audio to silence
+      if (e.t === EV.CLEAR) {
+        const ids = e.l === 0 ? this.loopers.map((x) => x.id) : [e.l];
+        ids.forEach((id) => {
+          if (e.l !== 0 && e.s >= 0) this.send(id, CMD.CLEAR_SECTION, e.s);
+          else this.send(id, CMD.CLEAR_ALL);
+        });
+        return;
+      }
       if (e.t >= EV.FILTER && e.t <= EV.EQ_HI) {
         // the demo jumps straight to the value (the real JSFX does the transition)
         const val = e.v % 256;
@@ -133,7 +141,10 @@ export class DemoClient {
       const l = this.loopers.find((x) => x.id === e.l);
       if (!l) return;
       const sec = e.s >= 0 ? e.s : 0;
-      if (e.t === EV.REC) this.send(l.id, CMD.HOLD, sec);
+      if (e.t === EV.REC) {
+        // rifatta dopo Indietro: se sta gia' registrando resta in rec (la take riparte)
+        if (!(r.redo && r.redo[i] && l.sections[sec].st >= ST.RECORDING)) this.send(l.id, CMD.HOLD, sec);
+      }
       else if (e.t === EV.CUE_REC) this.send(l.id, CMD.CUE_REC, sec);
       else if (e.t === EV.PLAY) { const x = l.sections[sec]; if (x.has && x.st < ST.PLAYING) this.exec(l, sec, PEND.PLAY); }
       else if (e.t === EV.PAUSE) this.exec(l, sec, PEND.STOP);
@@ -263,6 +274,7 @@ export class DemoClient {
       show: {
         st: this.run.st,
         bar: this.run.bar,
+        back: this.run.st && this.run.back && (performance.now() - this.t0) / 1000 < this.run.backUntil ? this.run.back : 0,
         name: this.show ? this.show.name : '',
         bars: this.show ? this.show.bars : 0,
         n: this.show ? this.show.events.length : 0,
@@ -272,7 +284,7 @@ export class DemoClient {
               return e ? `bar ${e.bar}` : '';
             })()
           : '',
-        ver: 12,
+        ver: 15,
         book: this.run.nbook || 0,
         done: this.run.ndone || 0,
         fall: 0,
@@ -423,7 +435,7 @@ export class DemoClient {
       this.uno.lead = Math.floor(arg / 2);
       return;
     }
-    if (code >= CMD.SHOW_SET && code <= CMD.SHOW_CONTINUE) {
+    if ((code >= CMD.SHOW_SET && code <= CMD.SHOW_CONTINUE) || code === CMD.SHOW_BACK) {
       const t = (performance.now() - this.t0) / 1000;
       if (code === CMD.SHOW_SET) this.show = parseShow(this.showText);
       else if (code === CMD.SHOW_SAVE && this.show) {
@@ -442,7 +454,24 @@ export class DemoClient {
         this.playing = true;
         this.run = { st: 1, bar: 1, start: Math.ceil(t / bar) * bar, paused: 0, fired: {} };
       } else if (code === CMD.SHOW_STOP) this.run = { st: 0, bar: 0 };
-      else if (code === CMD.SHOW_CONTINUE && this.run.st === 2) {
+      else if (code === CMD.SHOW_BACK && this.run.st === 1) {
+        const r = this.run;
+        const bar = this.barSec();
+        const cur = Math.floor((t - r.start - r.paused) / bar) + 1;
+        if (cur < 1) return;
+        const REDO = [EV.REC, EV.PLAY, EV.PAUSE, EV.CUE_REC, EV.PLAY_ALL, EV.STOP_ALL, EV.PATTERN, EV.STACCO, EV.SYNTH, EV.TEMPO];
+        r.redo = r.redo || {};
+        this.show.events.forEach((e, i) => {
+          if (e.bar >= cur && r.fired[i] && REDO.includes(e.t)) {
+            delete r.fired[i];
+            r.redo[i] = true;
+          }
+        });
+        if (!(t < r.backUntil)) r.back = 0;
+        r.paused += bar;
+        r.back = (r.back || 0) + 1;
+        r.backUntil = r.start + r.paused + (cur - 1) * bar;
+      } else if (code === CMD.SHOW_CONTINUE && this.run.st === 2) {
         const bar = this.barSec();
         this.run.paused += Math.ceil(t / bar) * bar - this.run.holdAt;
         this.run.st = 1;
