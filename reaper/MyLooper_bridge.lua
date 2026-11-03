@@ -355,15 +355,11 @@ local function cleanDrumMidiOut()
 end
 
 -- Pattern change. Two ways to the machine:
---  - through MyLooper_gate.jsfx on the first drum track (its MIDI output goes to the
---    machine): on the exact beat, and on any REAPER version. Used when it is ready.
---  - SendMIDIMessageToHardware, right away (needs a recent REAPER).
+--  SendMIDIMessageToHardware, straight to its MIDI output (needs REAPER 7). The route through
+--  the gate's track MIDI output was tried in the rehearsal room and did not reach the UNO
+--  (a Program Change sent that way did nothing, the same one sent directly worked).
 -- beat: when it has to arrive (quarter notes), nil = now.
-local function gateMidiReady()
-  local tr = drums.tracks[1]
-  return tr and uno.dev >= 0 and gateAlive(reaper.time_precise())
-    and reaper.GetMediaTrackInfo_Value(tr, "I_MIDIHWOUT") == uno.dev * 32
-end
+local function gateMidiReady() return false end   -- the gate route does not reach the UNO
 
 local sxSeq = 0
 sendPattern = function(n, beat)
@@ -371,24 +367,15 @@ sendPattern = function(n, beat)
   if n < 1 or n > 100 then return end
   if uno.dev < 0 then scanUno() end
   if uno.dev < 0 then uno.err = "UNO Drum non trovata tra le uscite MIDI" return end
-  reaper.SetExtState(EXT, "drum_sync_used", "1", true)   -- keep the MIDI output we set
-  prepareDrumSync(false)
-  local b = math.max(0, math.min(127, n - unoSetting("uno_ofs", 0)))
-  local msg = { 0xF0, 0x00, 0x21, 0x1A, 0x02, 0x02, 0x35, 0x00, b, 0xF7 }
-  if gateMidiReady() then
-    sxSeq = math.max(sxSeq, reaper.gmem_read(GATE + 20)) + 1
-    reaper.gmem_write(GATE + 22, #msg)
-    for k, v in ipairs(msg) do reaper.gmem_write(GATE + 22 + k, v) end
-    reaper.gmem_write(GATE + 21, beat or 0)
-    reaper.gmem_write(GATE + 20, sxSeq)              -- request number last: never half written
-    uno.route = "gate"
-  elseif reaper.SendMIDIMessageToHardware then
-    reaper.SendMIDIMessageToHardware(uno.dev, string.char(table.unpack(msg)))
-    uno.route = "api"
-  else
-    uno.err = "Non riesco a mandarlo: manca il gate sulla traccia drum e REAPER e' troppo vecchio"
+  if not reaper.SendMIDIMessageToHardware then
+    -- REAPER 6.x: the gate route was tried and does not reach the UNO
+    uno.err = "Per il cambio pattern serve REAPER 7 (la 6 non manda SysEx all'hardware)"
     return
   end
+  local b = math.max(0, math.min(127, n - unoSetting("uno_ofs", 0)))
+  reaper.SendMIDIMessageToHardware(uno.dev,
+    string.char(0xF0, 0x00, 0x21, 0x1A, 0x02, 0x02, 0x35, 0x00, b, 0xF7))
+  uno.route = "api"
   uno.last, uno.sent, uno.err = n, uno.sent + 1, ""
 end
 
@@ -981,6 +968,8 @@ local function parseShow(text)
   end
   table.sort(sh.events, function(a, b)
     if a.bar ~= b.bar then return a.bar < b.bar end
+    -- the wait goes last in its bar: everything else on that bar happens first
+    if (a.t == 13) ~= (b.t == 13) then return b.t == 13 end
     return a.t < b.t
   end)
   return sh
@@ -1057,8 +1046,12 @@ local function eventQN(e)
   return run.start + run.paused + (e.bar - 1) * run.bar
 end
 
-local function startShow()
+local chaseTo   -- below: puts everything as it would be at a bar (for "Avvia da bar X")
+
+-- fromBar: start the scaletta from that bar (1 / nil = from the beginning)
+local function startShow(fromBar)
   if not show then return end
+  fromBar = math.max(1, math.floor(fromBar or 1))
   local wasPlaying = isPlaying()
   if not wasPlaying then
     if show.tempo and show.tempo > 0 then reaper.SetCurrentBPM(0, show.tempo, false) end
@@ -1069,9 +1062,15 @@ local function startShow()
   local start = nextBarQN()
   -- se la stanghetta e' proprio adesso non c'e' il tempo di prenotare: la successiva
   if start - now < bar * 0.25 then start = start + bar end
-  run = { state = 1, start = start, paused = 0, bar = bar, fired = {}, booked = {},
-          check = {}, nbook = 0, ndone = 0, nfall = 0, newTake = {}, redo = {}, back = 0, backUntil = 0 }
+  run = { state = 1, start = start - (fromBar - 1) * bar, paused = 0, bar = bar, fired = {}, booked = {},
+          check = {}, nbook = 0, ndone = 0, nfall = 0, newTake = {}, redo = {}, back = 0, backUntil = 0,
+          from = fromBar }
   if wasPlaying and show.tempo and show.tempo > 0 then setTempo(show.tempo, start) end
+  if fromBar > 1 then
+    -- what comes before is not played: it is "chased" (applied now, as it would be at that bar)
+    for i, e in ipairs(show.events) do if e.bar < fromBar then run.fired[i] = true end end
+    chaseTo(fromBar, start)
+  end
   -- uno stacco anche sulla drum? serve il gate sulle sue tracce
   for _, e in ipairs(show.events) do
     if e.t == 17 and e.l == 0 and math.floor(e.v / 4096) % 4 > 0 then ensureGate() break end
@@ -1132,9 +1131,11 @@ local function rewindShow()
   run.backUntil = nextLine
 end
 
+-- Attesa: the scaletta stays on its bar (the loops and the drum keep going round) until
+-- Continua; from the next bar line it goes on with the bar after the wait.
 local function continueShow()
   if run.state ~= 2 then return end
-  run.paused = run.paused + (nextBarQN() - run.holdAt)
+  run.paused = run.paused + (nextBarQN() - run.holdAt) - run.bar
   run.state = 1
 end
 
@@ -1243,6 +1244,87 @@ local function fireEvent(e)
   end
 end
 
+-- "Avvia da bar X": everything that happened before X is applied right away, like a DAW
+-- "chasing" its controllers. Recs are not redone: a section that was recorded before X
+-- simply goes in play if it has something (from the last time you played it), the ones
+-- that were paused / cleared before X go paused / cleared. Filter and EQ go to their
+-- last value, drum on/off, pattern, synth sound and BPM to the last ones.
+chaseTo = function(X, startQN)
+  local sec = {}        -- "id:s" -> "play" | "pause" | "clear"
+  local fx = {}         -- "id:s:t" -> event with the last value
+  local drumOn, pattern, sound, bpm = nil, nil, nil, nil
+  local function ids(l) local t = {} if l == 0 then for _, x in ipairs(loopers) do t[#t + 1] = x.id end else t[1] = l end return t end
+  local function setSec(l, s, v)
+    for _, id in ipairs(ids(l)) do
+      if s >= 0 and l ~= 0 then sec[id .. ":" .. s] = v
+      else for k = 0, 7 do sec[id .. ":" .. k] = v end end
+    end
+  end
+  for _, e in ipairs(show.events) do
+    if e.bar < X then
+      if e.t == 1 or e.t == 2 then setSec(e.l, e.s, "play")
+      elseif e.t == 3 or e.t == 4 then setSec(e.l, e.s, "pause")      -- a silent rec ends in pause
+      elseif e.t == 14 or e.t == 5 then setSec(e.l, e.s, "play")
+      elseif e.t == 15 or e.t == 6 then setSec(e.l, e.s, "pause")
+      elseif e.t == 19 then setSec(e.l, e.s, "clear")
+      elseif e.t >= 7 and e.t <= 10 then fx[e.l .. ":" .. e.s .. ":" .. e.t] = e
+      elseif e.t == 11 then
+        if e.v == 2 then
+          if drumOn == nil then drumOn = drums.mute == 0 end
+          drumOn = not drumOn
+        else
+          drumOn = e.v == 1
+        end
+      elseif e.t == 16 then pattern = e.v
+      elseif e.t == 18 then sound = e.v
+      elseif e.t == 12 and e.v > 0 then bpm = e.v / 100
+      end
+    end
+  end
+  -- What the scaletta only touches AFTER X did not exist yet at bar X: those sections are
+  -- silent there (paused, the audio stays: their rec later on starts a new take anyway),
+  -- and a filter / EQ that only moves later is still at its starting point (open / flat).
+  local laterFx = {}
+  for _, e in ipairs(show.events) do
+    if e.bar >= X then
+      if (e.t >= 1 and e.t <= 6) or e.t == 14 or e.t == 15 or e.t == 19 then
+        for _, id in ipairs(ids(e.l)) do
+          local list = (e.s >= 0 and e.l ~= 0) and { e.s } or { 0, 1, 2, 3, 4, 5, 6, 7 }
+          for _, k in ipairs(list) do
+            local key = id .. ":" .. k
+            if sec[key] == nil then sec[key] = "pause" end
+          end
+        end
+      elseif e.t >= 7 and e.t <= 10 then
+        local key = e.l .. ":" .. e.s .. ":" .. e.t
+        if fx[key] == nil and not laterFx[key] then
+          laterFx[key] = { t = e.t, l = e.l, s = e.s, v = 100, bar = e.bar }   -- 100 = open / flat
+        end
+      end
+    end
+  end
+  for key, e in pairs(laterFx) do fx[key] = e end
+  for key, v in pairs(sec) do
+    local id, s = key:match("^(%d+):(%d+)$")
+    id, s = tonumber(id), tonumber(s)
+    local st, has = gsec(id, s), gsec(id, s, 2)
+    if v == "clear" then
+      if has > 0 or st > 0 then push(id, 9, s) end
+    elseif v == "play" then
+      if has > 0 and st < 2 then push(id, 22, s) end
+    elseif st >= 2 then
+      push(id, 22, s)
+    end
+  end
+  for _, e in pairs(fx) do
+    fireEvent({ t = e.t, l = e.l, s = e.s, v = e.v % 256, bar = e.bar })   -- straight to the value
+  end
+  if drumOn ~= nil then setDrums(drumOn and 0 or 1) end
+  if pattern then sendPattern(pattern) end
+  if sound then loadSound(sound) end
+  if bpm then setTempo(bpm, startQN) end
+end
+
 -- stacco: v = pos + 64*dur (+ 4096 if the drum stops too), pos / dur in eighths.
 -- Booked in the JSFX (and in the drum gate) for the exact beats.
 local function bookStacco(e, at)
@@ -1298,6 +1380,7 @@ local function runShow()
           run.fired[i] = true
           run.state = 2
           run.holdAt = at
+          run.holdBar = e.bar
           return
         end
         holdBar = e.bar
@@ -1416,6 +1499,7 @@ local function showState()
   local bar, nextTxt = 0, ""
   if run.state > 0 and show then
     bar = math.floor((nowQN() - run.start - run.paused) / run.bar) + 1
+    if run.state == 2 and run.holdBar then bar = run.holdBar end   -- waiting: still on that bar
     if bar < 1 then bar = 0 end
     for i, e in ipairs(show.events) do
       if not run.fired[i] then
@@ -1454,11 +1538,27 @@ local function handle(target, code, arg)
     return
   end
   -- scaletta
-  if code == 210 then show = parseShow(reaper.GetExtState(EXT, "show")) return end
+  if code == 210 then                                -- the scaletta from the iPad, in pieces
+    local n = tonumber(reaper.GetExtState(EXT, "show_n"))
+    local text
+    if n and n > 0 then
+      local parts = {}
+      for i = 0, n - 1 do
+        local p = reaper.GetExtState(EXT, "show_" .. i)
+        if p:find("%%%x%x") then p = p:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end) end
+        parts[#parts + 1] = p
+      end
+      text = table.concat(parts)
+    else
+      text = reaper.GetExtState(EXT, "show")               -- older page
+    end
+    show = parseShow(text)
+    return
+  end
   if code == 211 then saveShow(arg) return end
   if code == 212 then loadShow(arg) return end
   if code == 213 then deleteShow(arg) return end
-  if code == 214 then startShow() return end
+  if code == 214 then startShow(arg) return end
   if code == 215 then stopShow() return end
   if code == 216 then continueShow() return end
   if code == 219 then rewindShow() return end          -- scaletta: back one bar

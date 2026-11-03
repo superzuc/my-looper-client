@@ -124,7 +124,7 @@ export const EV_INFO = {
   [EV.EQ_HI]: { icon: 'ALT', label: 'Alti', cls: 'fx' },
   [EV.DRUMS]: { icon: 'DRM', label: 'Drum machine', cls: 'drum' },
   [EV.TEMPO]: { icon: 'BPM', label: 'BPM', cls: 'drum' },
-  [EV.WAIT]: { icon: 'ATT', label: 'Aspetta che prema', cls: 'wait' },
+  [EV.WAIT]: { icon: 'ATT', label: 'Attesa (ripete la bar)', cls: 'wait' },
   [EV.PLAY_ALL]: { icon: '▶▶', label: 'Play di tutte', cls: 'play' },
   [EV.STOP_ALL]: { icon: '■', label: 'Stop di tutte', cls: 'stop' },
   [EV.PATTERN]: { icon: 'PAT', label: 'Pattern drum', cls: 'drum' },
@@ -189,3 +189,35 @@ export function parseShow(text) {
 export const tapArg = (section, lateMs) => section + 8 * Math.round(lateMs);
 export const volArg = (section, vol) => section + 8 * Math.round(Math.max(0, Math.min(2, vol)) * 100);
 export const panArg = (section, pan) => section + 8 * Math.round(Math.max(-1, Math.min(1, pan)) * 100 + 100);
+
+// Unisci: mette un'altra scaletta prima o dopo questa. "dopo" parte dalla bar fromBar
+// (di solito subito dopo la fine; se e' prima della fine le due si sovrappongono).
+// Se le due hanno BPM diversi, all'inizio della parte nuova c'e' un evento BPM.
+export function mergeShows(cur, other, where = 'after', fromBar = null) {
+  const curBars = cur.bars || 32;
+  const othBars = other.bars || 32;
+  const move = (evs, d) => evs.map((e) => ({ ...e, bar: e.bar + d }));
+  const tempoAt = (bar, bpm) => ({ bar, t: EV.TEMPO, l: 0, s: -1, v: Math.round(bpm * 100) });
+  const hasTempoAt = (evs, bar) => evs.some((e) => e.t === EV.TEMPO && e.bar === bar);
+  let events;
+  let bars;
+  let tempo = cur.tempo || 0;
+  if (where === 'before') {
+    events = [...other.events, ...move(cur.events, othBars)];
+    bars = othBars + curBars;
+    tempo = other.tempo || cur.tempo || 0;
+    if (cur.tempo > 0 && cur.tempo !== tempo && !hasTempoAt(events, othBars + 1)) {
+      events.push(tempoAt(othBars + 1, cur.tempo));
+    }
+  } else {
+    const start = Math.max(1, Math.round(fromBar || curBars + 1));
+    const moved = move(other.events, start - 1);
+    events = [...cur.events, ...moved];
+    bars = Math.max(curBars, start - 1 + othBars);
+    if (other.tempo > 0 && other.tempo !== (cur.tempo || 0) && !hasTempoAt(events, start)) {
+      events.push(tempoAt(start, other.tempo));
+    }
+  }
+  events.sort((a, b) => a.bar - b.bar || a.t - b.t);
+  return { ...cur, bars: Math.min(256, bars), tempo, events };
+}

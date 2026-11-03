@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ALL_LOOPERS, CMD, EV, EV_INFO, FADE_STEPS, eighthsLabel, fxEvArg, fxEvParts, parseShow, posLabel, serializeShow, stacArg, stacParts,
+  ALL_LOOPERS, CMD, EV, EV_INFO, FADE_STEPS, eighthsLabel, fxEvArg, fxEvParts, mergeShows, parseShow, posLabel, serializeShow, stacArg, stacParts,
 } from '../lib/protocol';
 import { fadeLabel } from './FadeButton';
 import HoldButton from './HoldButton';
@@ -284,6 +284,30 @@ export default function ShowPanel({ state, send, client, onClose }) {
   const loopers = useMemo(() => state?.loopers || [], [state]);
   const live = state?.show;
   const [show, setShow] = useState(() => ({ name: 'Scaletta 1', bars: 32, tempo: 0, events: [] }));
+  // modifiche annullabili (aggiungi, togli, cancella selezione, incolla, unisci)
+  const hist = useRef([]);
+  const [histN, setHistN] = useState(0);
+  const edit = useCallback((fn) => {
+    setShow((prev) => {
+      hist.current.push(prev);
+      if (hist.current.length > 60) hist.current.shift();
+      return fn(prev);
+    });
+    setHistN(hist.current.length);
+  }, []);
+  const undo = useCallback(() => {
+    const prev = hist.current.pop();
+    if (prev) setShow(prev);
+    setHistN(hist.current.length);
+  }, []);
+  // selezione a rettangolo, appunti, partenza da una bar
+  const [sel, setSel] = useState(null);          // { r0, b0, r1, b1 } (indici di riga, bar)
+  const [selMode, setSelMode] = useState(false);
+  const [clip, setClip] = useState(null);        // { items: [{...evento, dbar}], w }
+  const [pasteMode, setPasteMode] = useState(false);
+  const [startFrom, setStartFrom] = useState(null);
+  const drag = useRef(null);
+  const skipClick = useRef(false);
   const [extraRows, setExtraRows] = useState([]);
   const [pick, setPick] = useState(null);     // { key, bar, l, s, step, t }
   const [addRow, setAddRow] = useState(false);
@@ -291,6 +315,24 @@ export default function ShowPanel({ state, send, client, onClose }) {
   const [busy, setBusy] = useState('');
   const [drumOpen, setDrumOpen] = useState(false);
   const [synthOpen, setSynthOpen] = useState(false);
+  const [merge, setMerge] = useState(null);   // { slot, where: 'before' | 'after', from }
+  // dopo Salva: controlla che nel file ci siano davvero tutti gli eventi
+  const [saveCheck, setSaveCheck] = useState(null);
+  useEffect(() => {
+    if (!saveCheck) return undefined;
+    const sl = (live?.slots || []).find((x) => x.slot === saveCheck.slot);
+    if (sl && sl.n === saveCheck.n) {
+      setBusy(`Salvata · ${saveCheck.n} eventi`);
+      setSaveCheck(null);
+      const t = setTimeout(() => setBusy(''), 2500);
+      return () => clearTimeout(t);
+    }
+    const t = setTimeout(() => {
+      setBusy('⚠ Non salvata del tutto: riprova');
+      setSaveCheck(null);
+    }, 4000 - Math.min(3500, Date.now() - saveCheck.t));
+    return () => clearTimeout(t);
+  }, [live, saveCheck]);
   const synthList = state?.synth?.list || [];
   // ottavi in una bar (4/4 = 8, 3/4 e 6/8 = 6)
   const barEighths = useMemo(() => {
@@ -315,6 +357,30 @@ export default function ShowPanel({ state, send, client, onClose }) {
       }
     },
     [client, send, show]
+  );
+
+  // Unisci: carica l'altra scaletta dal disco e la mette prima o dopo questa, nell'editor
+  // (poi la salvi dove vuoi)
+  const doMerge = useCallback(
+    (m) => {
+      send(ALL_LOOPERS, CMD.SHOW_LOAD, m.slot);
+      setBusy('Unisco…');
+      setTimeout(async () => {
+        try {
+          const other = parseShow(client && client.getShow ? await client.getShow() : '');
+          if (!other) {
+            setBusy('Quella scaletta è vuota');
+          } else {
+            edit((cur) => mergeShows(cur, other, m.where, m.where === 'after' ? m.from : null));
+            setBusy(`Unita "${other.name}" ${m.where === 'before' ? 'prima' : `dalla bar ${m.from}`}: ricordati di salvare`);
+          }
+        } catch {
+          setBusy('Non riesco a leggerla');
+        }
+        setTimeout(() => setBusy(''), 4000);
+      }, 350);
+    },
+    [client, send, edit]
   );
 
   const loadSlot = useCallback(
@@ -376,7 +442,7 @@ export default function ShowPanel({ state, send, client, onClose }) {
   }, [show.events]);
 
   const addEvent = (row, bar, t, v = 0) => {
-    setShow((sh) => ({
+    edit((sh) => ({
       ...sh,
       events: [...sh.events, { bar, t, l: row.l, s: row.s, v }],
       bars: Math.max(sh.bars, bar),
@@ -384,9 +450,120 @@ export default function ShowPanel({ state, send, client, onClose }) {
     setPick(null);
   };
   const removeEvent = (i) => {
-    setShow((sh) => ({ ...sh, events: sh.events.filter((_, k) => k !== i) }));
+    edit((sh) => ({ ...sh, events: sh.events.filter((_, k) => k !== i) }));
     setPick(null);
   };
+
+  // ---------- selezione, copia / taglia / incolla / cancella ----------
+  const rowIndex = useMemo(() => {
+    const m = new Map();
+    rows.forEach((r, i) => m.set(r.key, i));
+    return m;
+  }, [rows]);
+  const selBox = sel && {
+    r0: Math.min(sel.r0, sel.r1), r1: Math.max(sel.r0, sel.r1),
+    b0: Math.min(sel.b0, sel.b1), b1: Math.max(sel.b0, sel.b1),
+  };
+  const inBox = (e, box) => {
+    const r = rowIndex.get(rowKey(e.l, e.s));
+    return r !== undefined && r >= box.r0 && r <= box.r1 && e.bar >= box.b0 && e.bar <= box.b1;
+  };
+  const selEvents = selBox ? show.events.filter((e) => inBox(e, selBox)) : [];
+  const deleteSel = () => {
+    if (!selBox) return;
+    edit((sh) => ({ ...sh, events: sh.events.filter((e) => !inBox(e, selBox)) }));
+  };
+  const copySel = () => {
+    if (!selBox) return;
+    setClip({ items: selEvents.map((e) => ({ ...e, dbar: e.bar - selBox.b0 })), w: selBox.b1 - selBox.b0 + 1 });
+  };
+  const pasteAt = (bar) => {
+    if (!clip) return;
+    edit((sh) => {
+      const add = clip.items.map(({ dbar, ...e }) => ({ ...e, bar: bar + dbar }));
+      const same = (a, b) => a.bar === b.bar && a.t === b.t && a.l === b.l && a.s === b.s && a.v === b.v;
+      const events = [...sh.events, ...add.filter((a) => !sh.events.some((e) => same(a, e)))];
+      return { ...sh, events, bars: Math.min(256, Math.max(sh.bars, bar + clip.w - 1)) };
+    });
+    const rs = clip.items.map((e) => rowIndex.get(rowKey(e.l, e.s))).filter((r) => r !== undefined);
+    if (rs.length) setSel({ r0: Math.min(...rs), r1: Math.max(...rs), b0: bar, b1: bar + clip.w - 1 });
+    setPasteMode(false);
+  };
+  const cellAt = (x, y) => {
+    const el = document.elementFromPoint(x, y);
+    const c = el && el.closest && el.closest('[data-cell]');
+    return c ? { r: Number(c.dataset.r), b: Number(c.dataset.b) } : null;
+  };
+  // trascinare: col mouse sempre, col dito solo in modalita' "Seleziona" (se no scorre)
+  const onCellDown = (e, r, b) => {
+    if (pasteMode) return;
+    const mouse = e.pointerType === 'mouse';
+    if (!selMode && !mouse) return;
+    if (mouse && e.button !== 0) return;
+    drag.current = { r, b, moved: false };
+    if (selMode) setSel({ r0: r, b0: b, r1: r, b1: b });
+    const move = (ev) => {
+      const d = drag.current;
+      const c = cellAt(ev.clientX, ev.clientY);
+      if (!d || !c) return;
+      if (c.r !== d.r || c.b !== d.b) d.moved = true;
+      if (d.moved || selMode) setSel({ r0: d.r, b0: d.b, r1: c.r, b1: c.b });
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      if (drag.current && (drag.current.moved || selMode)) {
+        // ignora il click che segue questo trascinamento (se il click non arriva, dimentica)
+        skipClick.current = true;
+        setTimeout(() => {
+          skipClick.current = false;
+        }, 60);
+      }
+      drag.current = null;
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+  const onCellClick = (row, b, evs) => {
+    if (skipClick.current) {
+      skipClick.current = false;
+      return;
+    }
+    if (pasteMode) {
+      pasteAt(b);
+      return;
+    }
+    setSel(null);
+    setPick({ row, bar: b, evs });
+  };
+
+  // tastiera: Canc cancella, Cmd/Ctrl + C X V Z, Esc toglie la selezione
+  useEffect(() => {
+    const onKey = (e) => {
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      const mod = e.metaKey || e.ctrlKey;
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selBox) {
+        e.preventDefault();
+        deleteSel();
+      } else if (e.key === 'Escape') {
+        setSel(null);
+        setPasteMode(false);
+      } else if (mod && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        undo();
+      } else if (mod && e.key.toLowerCase() === 'c' && selBox) {
+        copySel();
+      } else if (mod && e.key.toLowerCase() === 'x' && selBox) {
+        copySel();
+        deleteSel();
+      } else if (mod && e.key.toLowerCase() === 'v' && clip) {
+        pasteAt(selBox ? selBox.b0 : 1);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
 
   const running = live && live.st > 0;
   const waiting = live && live.st === 2;
@@ -435,9 +612,9 @@ export default function ShowPanel({ state, send, client, onClose }) {
         {/* trasporto della scaletta */}
         <div className="show-run">
           {!running ? (
-            <button type="button" className="big-btn big-btn--play" onClick={() => push(CMD.SHOW_START)}>
+            <button type="button" className="big-btn big-btn--play" onClick={() => push(CMD.SHOW_START, startFrom || 0)}>
               <span className="big-btn__icon">▶</span>
-              <span>Avvia</span>
+              <span>{startFrom ? `Avvia dalla bar ${startFrom}` : 'Avvia'}</span>
             </button>
           ) : (
             <button type="button" className="big-btn big-btn--stop" onClick={() => send(ALL_LOOPERS, CMD.SHOW_STOP)}>
@@ -461,6 +638,16 @@ export default function ShowPanel({ state, send, client, onClose }) {
               <span>Continua</span>
             </button>
           )}
+          {state?.drums && state.drums.n > 0 && (
+            <button
+              type="button"
+              className={`chip show-run__drum ${state.drums.mute ? 'is-off' : ''} ${state.drums.pend >= 0 ? 'is-pending' : ''}`}
+              onClick={() => send(ALL_LOOPERS, CMD.DRUMS)}
+              title="Drum machine in pausa / in play (a fine bar)"
+            >
+              {state.drums.mute ? '▶' : '❚❚'} Drum
+            </button>
+          )}
           <HoldButton
             ms={1000}
             className="chip chip--danger show-run__clear"
@@ -478,7 +665,18 @@ export default function ShowPanel({ state, send, client, onClose }) {
                 </span>
               </>
             ) : (
-              <span className="muted">Parte dalla prossima stanghetta</span>
+              <span className="muted">
+                {startFrom ? (
+                  <>
+                    Parte dalla bar {startFrom}, con tutto com'è a quel punto{' '}
+                    <button type="button" className="chip chip--sm" onClick={() => setStartFrom(null)}>
+                      ✕ dall'inizio
+                    </button>
+                  </>
+                ) : (
+                  'Parte dalla prossima stanghetta · tocca il numero di una bar per partire da lì'
+                )}
+              </span>
             )}
           </div>
         </div>
@@ -532,6 +730,15 @@ export default function ShowPanel({ state, send, client, onClose }) {
           >
             Nuova
           </button>
+          <button
+            type="button"
+            className="chip"
+            disabled={running}
+            onClick={() => setMerge({ slot: null, where: 'after', from: (show.bars || 32) + 1 })}
+            title={running ? 'Ferma la scaletta per unirne un\'altra' : 'Metti un\'altra scaletta prima o dopo questa'}
+          >
+            Unisci
+          </button>
           {busy && <span className="muted">{busy}</span>}
         </div>
 
@@ -550,29 +757,78 @@ export default function ShowPanel({ state, send, client, onClose }) {
           ))}
         </div>
 
+        {/* strumenti di composizione */}
+        <div className="show-tools">
+          {/* sempre gli stessi pulsanti (spenti se non servono): la griglia non si sposta mentre trascini */}
+          <button type="button" className={`chip chip--sm ${selMode ? 'is-on' : ''}`} onClick={() => setSelMode((m) => !m)}>
+            ⬚ Seleziona
+          </button>
+          <span className="muted show-tools__count">
+            {selBox ? `${selEvents.length} eventi · ${selBox.b1 - selBox.b0 + 1} bar` : 'niente selezionato'}
+          </span>
+          <button type="button" className="chip chip--sm" disabled={!selBox} onClick={copySel}>
+            Copia
+          </button>
+          <button
+            type="button"
+            className="chip chip--sm"
+            disabled={!selBox}
+            onClick={() => {
+              copySel();
+              deleteSel();
+            }}
+          >
+            Taglia
+          </button>
+          <button type="button" className="chip chip--sm chip--danger" disabled={!selBox} onClick={deleteSel}>
+            Cancella
+          </button>
+          <button
+            type="button"
+            className={`chip chip--sm ${pasteMode ? 'is-on' : ''}`}
+            disabled={!clip}
+            onClick={() => setPasteMode((m) => !m)}
+          >
+            {pasteMode ? 'Tocca la bar dove incollare' : `Incolla${clip ? ` (${clip.items.length})` : ''}`}
+          </button>
+          <button type="button" className="chip chip--sm show-tools__undo" disabled={!histN} onClick={undo}>
+            ↶ Annulla
+          </button>
+        </div>
+
         {/* la griglia */}
-        <div className="showgrid">
+        <div className={`showgrid ${selMode ? 'is-selecting' : ''} ${pasteMode ? 'is-pasting' : ''}`}>
           <div className="showgrid__head">
             <div className="showgrid__rowlabel" />
             {barList.map((b) => (
-              <div key={b} className={`showgrid__col ${b === curBar && running ? 'is-now' : ''}`}>
-                {b % 4 === 1 || bars <= 16 ? b : ''}
+              <div
+                key={b}
+                className={`showgrid__col ${b === curBar && running ? 'is-now' : ''} ${b === startFrom ? 'is-start' : ''}`}
+                onClick={() => !running && setStartFrom(b === startFrom || b === 1 ? null : b)}
+                title="Parti da questa bar"
+              >
+                {b % 4 === 1 || bars <= 16 || b === startFrom ? b : ''}
               </div>
             ))}
           </div>
-          {rows.map((row) => (
+          {rows.map((row, ri) => (
             <div className="showgrid__row" key={row.key} style={{ '--track': row.color }}>
               <div className="showgrid__rowlabel">{row.label}</div>
               {barList.map((b) => {
                 const evs = byCell.get(`${row.key}@${b}`) || [];
+                const isSel = selBox && ri >= selBox.r0 && ri <= selBox.r1 && b >= selBox.b0 && b <= selBox.b1;
                 return (
                   <button
                     key={b}
                     type="button"
+                    data-cell="1"
+                    data-r={ri}
+                    data-b={b}
                     className={`showgrid__cell ${evs.length ? 'has-ev' : ''} ${
                       b === curBar && running ? 'is-now' : ''
-                    }`}
-                    onClick={() => setPick({ row, bar: b, evs })}
+                    } ${isSel ? 'is-sel' : ''} ${b === startFrom ? 'is-start' : ''}`}
+                    onPointerDown={(e) => onCellDown(e, ri, b)}
+                    onClick={() => onCellClick(row, b, evs)}
                   >
                     {evs.map((e) => (
                       <span key={e.i} className={`showev showev--${EV_INFO[e.t]?.cls}`}>
@@ -814,6 +1070,81 @@ export default function ShowPanel({ state, send, client, onClose }) {
           </div>
         )}
 
+        {/* unire un'altra scaletta */}
+        {merge && (
+          <div className="show-pick" onClick={() => setMerge(null)}>
+            <div className="show-pick__box" onClick={(e) => e.stopPropagation()}>
+              <div className="show-pick__head">
+                <strong>Unisci a "{show.name}"</strong>
+                <span className="muted"> · adesso è lunga {show.bars} bar</span>
+              </div>
+              <div className="stc__label">Quale scaletta</div>
+              <div className="show-pick__grid">
+                {(live?.slots || [])
+                  .filter((sl) => sl.name)
+                  .map((sl) => (
+                    <button
+                      key={sl.slot}
+                      type="button"
+                      className={`chip chip--sm ${merge.slot === sl.slot ? 'is-on' : ''}`}
+                      onClick={() => setMerge({ ...merge, slot: sl.slot })}
+                    >
+                      <strong>{sl.slot}</strong> {sl.name} <small>· {sl.bars} bar</small>
+                    </button>
+                  ))}
+              </div>
+              <div className="stc__label">Dove</div>
+              <div className="show-pick__grid">
+                <button
+                  type="button"
+                  className={`chip chip--sm ${merge.where === 'before' ? 'is-on' : ''}`}
+                  onClick={() => setMerge({ ...merge, where: 'before' })}
+                >
+                  Prima di questa
+                </button>
+                <button
+                  type="button"
+                  className={`chip chip--sm ${merge.where === 'after' ? 'is-on' : ''}`}
+                  onClick={() => setMerge({ ...merge, where: 'after' })}
+                >
+                  Dopo
+                </button>
+              </div>
+              {merge.where === 'after' && (
+                <>
+                  <div className="stc__label">
+                    Dalla bar <span className="muted">· {show.bars + 1} = subito dopo la fine</span>
+                  </div>
+                  <div className="show-pick__grid">
+                    <input
+                      className="show-name drumbox__num merge__from"
+                      type="number"
+                      min="1"
+                      max="256"
+                      value={merge.from}
+                      onChange={(e) => setMerge({ ...merge, from: Math.max(1, Number(e.target.value) || 1) })}
+                    />
+                    {merge.from <= show.bars && (
+                      <span className="muted">si sovrappone alle ultime {show.bars - merge.from + 1} bar</span>
+                    )}
+                  </div>
+                </>
+              )}
+              <button
+                type="button"
+                className="chip chip--ok stc__go"
+                disabled={!merge.slot}
+                onClick={() => {
+                  doMerge(merge);
+                  setMerge(null);
+                }}
+              >
+                Unisci
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* in quale slot salvare */}
         {saveTo && (
           <div className="show-pick" onClick={() => setSaveTo(false)}>
@@ -830,8 +1161,8 @@ export default function ShowPanel({ state, send, client, onClose }) {
                     onClick={() => {
                       push(CMD.SHOW_SAVE, sl.slot);
                       setSaveTo(false);
-                      setBusy('Salvata');
-                      setTimeout(() => setBusy(''), 1500);
+                      setBusy('Salvo…');
+                      setSaveCheck({ slot: sl.slot, n: show.events.length, t: Date.now() });
                     }}
                   >
                     <strong>{sl.slot}</strong> {sl.name || '—'}

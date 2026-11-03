@@ -110,10 +110,26 @@ Non serve nessun server esterno: la pagina la serve REAPER, lo script Lua fa da 
     zero senza uscire dalla scaletta.
   - stacco su *Generale*: scegli **chi si ferma**: tutti, solo i looper o **solo la drum** (es. la drum tace sul 4 e
     rientra sull'1). Durate fino a 4 bar.
-  - **attesa**: la scaletta arriva lì, tiene tutto com'è e riparte solo quando tocchi *Continua*. Mettine una dove
-    vuoi allungare un giro o aspettare il pubblico: tutto quello che viene dopo si sposta in avanti di conseguenza.
+  - **attesa**: arrivata a quella bar la scaletta **la ripete** (loop e drum continuano a girare) finché non
+    tocchi **Continua**; dalla stanghetta successiva riparte con la bar dopo. Perfetta per un assolo lungo quanto
+    vuoi. Gli altri eventi della stessa bar partono subito, prima dell'attesa; tutto quello che viene dopo si sposta.
   - **Avvia** fa partire la scaletta dalla **prossima stanghetta** e conta le bar da lì; sopra vedi la bar corrente
     e il prossimo evento, e la colonna della bar in corso è evidenziata.
+  - **comporre**: trascina col mouse sulla griglia (sull'iPad attiva *⬚ Seleziona* e trascina col dito) per
+    selezionare un rettangolo di righe e bar; poi **Copia / Taglia / Cancella** (o Canc, Cmd/Ctrl+C X V) e
+    **Incolla** toccando la bar di partenza (stesse righe). **↶ Annulla** (Cmd/Ctrl+Z) torna indietro.
+  - **Avvia da una bar**: tocca il numero di una bar in alto e premi *Avvia dalla bar N*. Quello che viene prima
+    non suona ma viene applicato subito, come farebbe una DAW: sezioni in play / pausa / scartate come sarebbero a
+    quel punto (le rec non si rifanno: suona quello che c'è dall'ultima volta), filtri ed EQ al loro valore, drum,
+    pattern, suono del synth e BPM agli ultimi impostati. Le sezioni che la scaletta usa solo più avanti vanno in
+    pausa (a quel punto non c'erano ancora; la loro rec più avanti fa una take nuova) e i filtri che si muovono solo
+    più avanti tornano aperti.
+  - nella scaletta c'è anche il pulsante **Drum** (pausa / play della drum machine).
+  - **Unisci**: mette un'altra scaletta salvata **prima** o **dopo** quella aperta (dopo: da una bar a scelta,
+    di default subito dopo la fine; prima della fine le due si sovrappongono). Se i BPM sono diversi mette un
+    evento BPM all'inizio della parte nuova. Il risultato resta nell'editor: salvalo dove vuoi.
+  - dopo **Salva** la pagina controlla che nel file ci siano tutti gli eventi ("Salvata · N eventi"); la
+    scaletta viaggia a pezzi perché il server web di REAPER taglia le richieste lunghe.
   - **8 slot** salvati nella cartella del progetto (`MyLooper/scalette/`), con nome e numero di eventi.
   - rec, play e pausa non le manda lo script: le **prenota nel JSFX con il beat esatto**, quindi cadono sul campione
     giusto come se le premessi tu (la correzione del ritardo recupera anche il pre-roll della rec).

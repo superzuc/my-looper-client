@@ -36,11 +36,21 @@ export class ReaperClient {
 
   // The scaletta is too big for the command channel: it goes in its own ExtState
   // key, then a command tells the bridge to read it.
+  // REAPER's web server cuts long URLs (around 1 KB): a long scaletta was arriving
+  // truncated, so its last events got lost. It goes in small pieces: show_0, show_1, ...
+  // and show_n (how many) last; the bridge puts them back together.
   async setShow(text) {
-    const res = await fetch(`/_/SET/EXTSTATE/${SECTION}/show/${encodeURIComponent(text)}`, {
-      cache: 'no-store',
-      method: 'GET',
-    });
+    const CHUNK = 200;
+    const parts = [];
+    for (let i = 0; i < text.length; i += CHUNK) parts.push(text.slice(i, i + CHUNK));
+    if (!parts.length) parts.push('');
+    for (let i = 0; i < parts.length; i++) {
+      const res = await fetch(`/_/SET/EXTSTATE/${SECTION}/show_${i}/${encodeURIComponent(parts[i])}`, {
+        cache: 'no-store',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    }
+    const res = await fetch(`/_/SET/EXTSTATE/${SECTION}/show_n/${parts.length}`, { cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   }
 

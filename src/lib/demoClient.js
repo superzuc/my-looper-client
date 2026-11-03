@@ -452,7 +452,10 @@ export class DemoClient {
       } else if (code === CMD.SHOW_START && this.show) {
         const bar = this.barSec();
         this.playing = true;
-        this.run = { st: 1, bar: 1, start: Math.ceil(t / bar) * bar, paused: 0, fired: {} };
+        const from = Math.max(1, arg || 1);
+        const fired = {};
+        this.show.events.forEach((e, i) => { if (e.bar < from) fired[i] = true; });
+        this.run = { st: 1, bar: from, start: Math.ceil(t / bar) * bar - (from - 1) * bar, paused: 0, fired };
       } else if (code === CMD.SHOW_STOP) this.run = { st: 0, bar: 0 };
       else if (code === CMD.SHOW_BACK && this.run.st === 1) {
         const r = this.run;
@@ -473,7 +476,7 @@ export class DemoClient {
         r.backUntil = r.start + r.paused + (cur - 1) * bar;
       } else if (code === CMD.SHOW_CONTINUE && this.run.st === 2) {
         const bar = this.barSec();
-        this.run.paused += Math.ceil(t / bar) * bar - this.run.holdAt;
+        this.run.paused += Math.ceil(t / bar) * bar - this.run.holdAt - bar;
         this.run.st = 1;
       }
       return;
