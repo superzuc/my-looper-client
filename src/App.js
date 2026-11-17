@@ -7,8 +7,10 @@ import FxPanel from './components/FxPanel';
 import ShowPanel from './components/ShowPanel';
 import ShowStrip from './components/ShowStrip';
 import GridView from './components/GridView';
+import LicenceScreen, { licenceLocked } from './components/LicenceScreen';
+import ImprovPanel from './components/ImprovPanel';
 import { isDemo, useLooper } from './hooks/useLooper';
-import { ALL_LOOPERS, PROTO } from './lib/protocol';
+import { ALL_LOOPERS, PROTO, parseImprov } from './lib/protocol';
 
 const PAGE_KEY = 'mylooper.page';
 const FADE_KEY = 'mylooper.fadeBars';
@@ -34,8 +36,9 @@ function Notice({ conn, state }) {
   if (conn === 'offline')
     return (
       <div className="notice">
-        <strong>REAPER non raggiungibile.</strong> Controlla che REAPER sia aperto, che il web server sia
-        attivo (Preferenze → Control/OSC/web) e che l'iPad sia sulla stessa rete Wi-Fi.{' '}
+        <strong>Looper non raggiungibile.</strong> Controlla che REAPER sia aperto con il web server attivo
+        (Preferenze → Control/OSC/web), oppure Ableton o Logic con il plugin GL-8 su una traccia, e che l'iPad sia
+        sulla stessa rete Wi-Fi.{' '}
         <a href="?demo">Prova la demo</a>
       </div>
     );
@@ -44,6 +47,13 @@ function Notice({ conn, state }) {
       <div className="notice">
         <strong>Bridge non attivo.</strong> In REAPER esegui lo script <code>MyLooper_bridge.lua</code>{' '}
         (Actions → Load ReaScript).
+      </div>
+    );
+  if (state && !state.demo && state.host === 'vst3' && state.proto !== PROTO)
+    return (
+      <div className="notice">
+        <strong>La pagina e il plugin GL-8 sono versioni diverse.</strong> Ricarica la pagina; se non basta
+        aggiorna il plugin.
       </div>
     );
   if (state && !state.demo && state.proto > PROTO)
@@ -70,7 +80,7 @@ function Notice({ conn, state }) {
   if (state && state.loopers.length === 0)
     return (
       <div className="notice">
-        <strong>Nessun looper trovato.</strong> Aggiungi il JSFX <code>MyLooper</code> alle tracce degli strumenti.
+        <strong>Nessun looper trovato.</strong> Aggiungi il JSFX <code>GL-8</code> (MyLooper.jsfx) o il plugin GL-8 alle tracce degli strumenti.
       </div>
     );
   return null;
@@ -84,6 +94,7 @@ export default function App() {
   const [showMem, setShowMem] = useState(false);
   const [fxTarget, setFxTarget] = useState(null);      // null = panel closed
   const [showOpen, setShowOpen] = useState(false);
+  const [improvFor, setImprovFor] = useState(null);    // looper id (0 = Generale), null = closed
   const [sel, setSel] = useState(null);                // { id, s } selected section
   const [grid, setGrid] = useState(false);
   const [fadeBars, setFadeBars] = useState(readFadeBars);
@@ -91,6 +102,8 @@ export default function App() {
   const toastTimer = useRef(null);
   const restored = useRef(false);
   const loopers = state?.loopers || [];
+  const improvNow = state?.improv?.now || 0;
+  const improvEvs = parseImprov(state?.improv?.ev).filter((e) => e.bar >= improvNow);
 
   // restore the last page once loopers are known
   useEffect(() => {
@@ -200,6 +213,8 @@ export default function App() {
             selected={sel && sel.id === l.id ? sel.s : null}
             onSelect={(x) => setSel(x === null ? null : { id: l.id, s: x })}
             onFx={(x) => setFxTarget({ id: l.id, s: x })}
+            onImprov={state?.improv ? () => setImprovFor(l.id) : null}
+            improvN={improvEvs.filter((e) => e.l === l.id).length}
           />
         ))}
       </main>
@@ -230,6 +245,16 @@ export default function App() {
           send={send}
           client={client.current}
           onClose={() => setShowOpen(false)}
+        />
+      )}
+      {licenceLocked(state) && conn !== 'offline' && <LicenceScreen state={state} send={send} />}
+      {improvFor !== null && (
+        <ImprovPanel
+          state={state}
+          send={send}
+          client={client.current}
+          looperId={improvFor}
+          onClose={() => setImprovFor(null)}
         />
       )}
       {fxTarget && (

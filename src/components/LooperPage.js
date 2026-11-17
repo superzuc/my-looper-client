@@ -20,6 +20,8 @@ export default function LooperPage({
   selected,
   onSelect,
   onFx,
+  onImprov,
+  improvN = 0,
 }) {
   const rootRef = useRef(null);
   const looperRef = useRef(looper);
@@ -218,6 +220,17 @@ export default function LooperPage({
           <button type="button" className="chip chip--fx" onClick={() => onFx(selHas ? selected : null)}>
             FX
           </button>
+
+          {onImprov && (
+            <button
+              type="button"
+              className={`chip chip--improv ${improvN > 0 ? 'is-on' : ''}`}
+              onClick={onImprov}
+              title="Le prossime 16 bar di questa traccia, dal vivo"
+            >
+              Improv{improvN > 0 && <span className="imp-tabs__n">{improvN}</span>}
+            </button>
+          )}
 
           {selHas ? (
             <HoldButton

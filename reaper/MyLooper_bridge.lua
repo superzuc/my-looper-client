@@ -30,7 +30,7 @@ local DRUM_GRACE    = 0.15         -- as in the JSFX: a press just after the bar
 -- Pattern changes go to the drum machine as SysEx on its MIDI output (IK UNO Drum:
 -- F0 00 21 1A 02 02 35 00 <pattern> F7, the same port REAPER already sends the clock to)
 local UNO_NAME      = "uno"        -- MIDI output whose name contains this (case insensitive)
-local GATE_FX       = { "JS:MyLooper/MyLooper_gate.jsfx", "JS:MyLooper/MyLooper_gate", "MyLooper Gate" }
+local GATE_FX       = { "JS:MyLooper/MyLooper_gate.jsfx", "JS:MyLooper/MyLooper_gate", "GL-8 Gate", "MyLooper Gate" }
 
 reaper.gmem_attach(NS)
 
@@ -71,8 +71,14 @@ local function scan()
     for f = 0, reaper.TrackFX_GetCount(tr) - 1 do
       local _, fxname = reaper.TrackFX_GetFXName(tr, f, "")
       local low = fxname:lower()
-      local isGate = low:find("mylooper gate", 1, true) or low:find("mylooper_gate", 1, true)
-      if fxname:find("MyLooper", 1, true) and not isGate and #list < MAX_LOOPERS then
+      -- the JSFX is "GL-8" (it was "MyLooper"; the file is still MyLooper.jsfx); only JS, so a
+      -- GL-8 VST3 on the same track is not taken for it
+      local isGate = low:find("gl-8 gate", 1, true) or low:find("mylooper gate", 1, true) or low:find("mylooper_gate", 1, true)
+      local okT, typ = false, nil
+      if reaper.TrackFX_GetNamedConfigParm then okT, typ = reaper.TrackFX_GetNamedConfigParm(tr, f, "fx_type") end   -- REAPER 6.37+
+      local isJS = (okT and typ == "JS") or (not okT and low:find("^js") ~= nil)
+      local isLooper = isJS and (low:find("gl-8", 1, true) or low:find("mylooper", 1, true))
+      if isLooper and not isGate and #list < MAX_LOOPERS then
         list[#list + 1] = { track = tr, fx = f }
         break -- one looper per track
       end
@@ -271,7 +277,7 @@ local function hasGate(tr)
   for f = 0, reaper.TrackFX_GetCount(tr) - 1 do
     local _, n = reaper.TrackFX_GetFXName(tr, f, "")
     n = n:lower()
-    if n:find("mylooper gate", 1, true) or n:find("mylooper_gate", 1, true) then return true end
+    if n:find("gl-8 gate", 1, true) or n:find("mylooper gate", 1, true) or n:find("mylooper_gate", 1, true) then return true end
   end
   return false
 end
@@ -1488,6 +1494,96 @@ local function runShow()
   end
 end
 
+---------------------------------------------------------------- improv
+-- The Improv: actions on the next 16 bars, written live from a track (its sections) or on
+-- the Generale row (drum, BPM, stacchi...). A second scaletta with its own runner, on the
+-- bars of the project (bar N = measure N), on top of a written scaletta that is running.
+-- Same code as the scaletta: show / run are swapped with ishow / irun around runShow().
+-- Commands: 250 = read ExtState improv_* (all its events from the current bar on), 251 = drop it.
+local ishow, irun = nil, { state = 0 }
+local function swapImprov() show, ishow = ishow, show; run, irun = irun, run end
+local function measureNow()
+  local _, measures = reaper.TimeMap2_timeToBeats(0, reaper.GetPlayPosition())
+  return math.floor(measures or 0)
+end
+local function improvNow() return isPlaying() and (measureNow() + 1) or 0 end
+local function evKey(e) return string.format("%d,%d,%d,%d,%d", e.bar, e.t, e.l, e.s, e.v) end
+
+local function improvClear()
+  if not ishow then return end
+  swapImprov(); stopShow(); swapImprov()
+  ishow, irun = nil, { state = 0 }
+end
+
+local function improvSet(sh)
+  if not isPlaying() then return end
+  local cur = improvNow()
+  local evs = {}
+  if sh then
+    for _, e in ipairs(sh.events) do
+      if e.t > 0 and e.t ~= 13 and e.bar >= cur then evs[#evs + 1] = e end   -- no waits
+    end
+  end
+  local bar = barQN()
+  local nr = { state = 1, start = (nextBarQN() - bar) - measureNow() * bar, paused = 0, bar = bar, fired = {},
+               booked = {}, check = {}, nbook = 0, ndone = 0, nfall = 0, newTake = {}, redo = {}, back = 0,
+               backUntil = 0, from = 1 }
+  if ishow and irun.state ~= 0 then
+    -- the same events keep what already happened to them (fired, booked, checked)
+    nr.start, nr.bar, nr.nstk = irun.start, irun.bar, irun.nstk
+    nr.check = irun.check or {}                          -- it holds the events, not their index
+    local map, used = {}, {}
+    for i, e in ipairs(ishow.events) do
+      local k = evKey(e)
+      for j, f in ipairs(evs) do
+        if not used[j] and evKey(f) == k then map[i] = j; used[j] = true; break end
+      end
+    end
+    for i in pairs(irun.fired or {}) do if map[i] then nr.fired[map[i]] = true end end
+    for key, i in pairs(irun.booked or {}) do
+      if map[i] then nr.booked[key] = map[i]
+      else                                               -- taken away before it happened
+        local id, s = key:match("^(%d+):(%d+)$")
+        if id then push(tonumber(id), 28, tonumber(s)) end
+      end
+    end
+    for i, v in pairs(irun.newTake or {}) do if map[i] then nr.newTake[map[i]] = v end end
+    if irun.clr then
+      nr.clr = {}
+      for i, v in pairs(irun.clr) do if map[i] then nr.clr[map[i]] = v end end
+    end
+  end
+  irun = nr
+  ishow = { name = "improv", bars = 0, tempo = 0, events = evs }
+  if #evs == 0 and next(irun.booked) == nil and #irun.check == 0 then ishow, irun = nil, { state = 0 } end
+end
+
+local function runImprov()
+  if not ishow then return end
+  if not isPlaying() then improvClear() return end      -- stopped: it's over
+  swapImprov(); runShow(); swapImprov()
+  if irun.state == 0 then ishow, irun = nil, { state = 0 } end   -- all done
+end
+
+local function improvState()
+  local parts = {}
+  if ishow then for _, e in ipairs(ishow.events) do parts[#parts + 1] = evKey(e) end end
+  return string.format('{"now":%d,"on":%d,"ev":%s}', improvNow(), ishow and 1 or 0, jsonStr(table.concat(parts, ";")))
+end
+
+-- a text the page sends in pieces: key_0, key_1, ... and key_n
+local function readChunks(key)
+  local n = tonumber(reaper.GetExtState(EXT, key .. "_n"))
+  if not n or n <= 0 then return reaper.GetExtState(EXT, key) end
+  local parts = {}
+  for i = 0, n - 1 do
+    local p = reaper.GetExtState(EXT, key .. "_" .. i)
+    if p:find("%%%x%x") then p = p:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end) end
+    parts[#parts + 1] = p
+  end
+  return table.concat(parts)
+end
+
 local function showState()
   local slots = {}
   for i = 1, SHOW_SLOTS do
@@ -1553,8 +1649,12 @@ local function handle(target, code, arg)
       text = reaper.GetExtState(EXT, "show")               -- older page
     end
     show = parseShow(text)
+    -- keep a copy the page can read back: after a reload it gets the scaletta that is playing
+    if show then reaper.SetExtState(EXT, "showdata", serializeShow(show), false) end
     return
   end
+  if code == 250 then improvSet(parseShow(readChunks("improv"))) return end   -- Improv
+  if code == 251 then improvClear() return end
   if code == 211 then saveShow(arg) return end
   if code == 212 then loadShow(arg) return end
   if code == 213 then deleteShow(arg) return end
@@ -1659,10 +1759,10 @@ local function buildState(now)
 
   return string.format(
     '{"t":%d,"proto":%d,"sess":%s,"ack":%d,"playing":%s,"tempo":%s,"loopers":[%s],"mem":[%s],' ..
-    '"job":%s,"drums":%s,"synth":%s,"show":%s}',
+    '"job":%s,"drums":%s,"synth":%s,"show":%s,"improv":%s}',
     tick, PROTO, jsonStr(lastSess), lastSeq, isPlaying() and "true" or "false",
     num(reaper.Master_GetTempo()), table.concat(out, ","), table.concat(mem, ","), jobJson, drumsJson, synthJson(),
-    showState())
+    showState(), improvState())
 end
 
 ---------------------------------------------------------------- main loop
@@ -1685,6 +1785,7 @@ local function step()
   runDrums()
   runSync()
   runShow()
+  runImprov()
   runJob(now)
   reaper.SetExtState(EXT, "state", buildState(now), false)
 end
@@ -1698,7 +1799,7 @@ local function main()
   local ok, err = pcall(step)
   if not ok and err ~= lastErr then
     lastErr = err
-    reaper.ShowConsoleMsg("MyLooper bridge: " .. tostring(err) .. "\n")
+    reaper.ShowConsoleMsg("GL-8 bridge: " .. tostring(err) .. "\n")
   end
   reaper.defer(main)
 end

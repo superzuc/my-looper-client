@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  ALL_LOOPERS, CMD, EV, EV_INFO, FADE_STEPS, eighthsLabel, fxEvArg, fxEvParts, mergeShows, parseShow, posLabel, serializeShow, stacArg, stacParts,
-} from '../lib/protocol';
-import { fadeLabel } from './FadeButton';
+import { ALL_LOOPERS, CMD, EV, EV_INFO, MACHINE_ROW, mergeShows, parseShow, serializeShow } from '../lib/protocol';
 import HoldButton from './HoldButton';
+import MachinesBox from './MachinesBox';
+import {
+  EventPicker, GEN_ACTIONS, LEADS, LOOP_ACTIONS, MACH_ACTIONS, SEC_ACTIONS,
+} from './ShowParts';
 
 // La scaletta: il pezzo scritto prima. Righe = strumenti e sezioni, colonne = bar.
 // Tocchi una casella e scegli cosa deve succedere lì; dal vivo premi Avvia e il
@@ -12,110 +13,8 @@ import HoldButton from './HoldButton';
 const GEN = 'gen';
 const rowKey = (l, s) => (l === 0 ? GEN : `${l}:${s}`);
 
-const SEC_ACTIONS = [EV.REC, EV.CUE_REC, EV.PLAY, EV.PAUSE, EV.CLEAR, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
-const LOOP_ACTIONS = [EV.PLAY_ALL, EV.STOP_ALL, EV.CLEAR, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
-const GEN_ACTIONS = [EV.WAIT, EV.CLEAR, EV.STACCO, EV.DRUMS, EV.PATTERN, EV.SYNTH, EV.TEMPO, EV.FILTER, EV.EQ_LO, EV.EQ_MID, EV.EQ_HI];
-const LEADS = [
-  { v: 0, label: 'Sulla stanghetta' },
-  { v: 1, label: '1/8 prima' },
-  { v: 2, label: '1/4 prima' },
-  { v: 4, label: '1/2 bar prima' },
-];
-
-const FILTER_PRESETS = [
-  { v: 0, label: 'Passa-basso tutto' },
-  { v: 50, label: 'Passa-basso metà' },
-  { v: 100, label: 'Aperto' },
-  { v: 150, label: 'Passa-alto metà' },
-  { v: 200, label: 'Passa-alto tutto' },
-];
-const EQ_PRESETS = [
-  { v: 0, label: 'Kill' },
-  { v: 50, label: 'Giù a metà' },
-  { v: 100, label: 'Normale' },
-  { v: 150, label: 'Su del 50%' },
-];
-const DRUM_PRESETS = [
-  { v: 0, label: 'Ferma la drum' },
-  { v: 1, label: 'Fai partire la drum' },
-];
-
-const isFx = (t) => t === EV.FILTER || (t >= EV.EQ_LO && t <= EV.EQ_HI);
-
-function needsValue(t) {
-  return t === EV.FADE_IN || t === EV.FADE_OUT || t === EV.FILTER || t === EV.TEMPO ||
-    (t >= EV.EQ_LO && t <= EV.EQ_HI) || t === EV.DRUMS || t === EV.PATTERN || t === EV.STACCO || t === EV.SYNTH;
-}
-
-function staccoLabel(v, barEighths) {
-  const p = stacParts(v);
-  const who = p.who === 'drum' ? ' · solo la drum' : p.who === 'all' ? ' · anche la drum' : '';
-  return `${eighthsLabel(p.dur, barEighths)} ${posLabel(p.pos)}${who}`;
-}
-
-// Stacco: da dove parte (gli ottavi della bar) e quanto dura. La musica sotto continua a
-// girare, quindi quando finisce tutto riparte esattamente a tempo.
-function StaccoPicker({ barEighths, gen, onAdd }) {
-  const [pos, setPos] = useState(0);
-  const [dur, setDur] = useState(2);
-  const [who, setWho] = useState('all');
-  const durs = [1, 2, 3, 4, 5, 6, 7]
-    .filter((d) => d < barEighths)
-    .concat([barEighths, barEighths * 2, barEighths * 4].filter((d) => d <= 63));
-  const cells = Array.from({ length: barEighths }, (_, i) => i);
-  return (
-    <div className="stc">
-      <div className="stc__label">
-        Da dove <span className="muted">· {posLabel(pos)}</span>
-      </div>
-      <div className="stc__bar" style={{ '--n': barEighths }}>
-        {cells.map((i) => (
-          <button
-            key={i}
-            type="button"
-            className={`stc__cell ${i % 2 === 0 ? 'is-beat' : ''} ${i >= pos && i < pos + dur ? 'is-on' : ''} ${
-              i === pos ? 'is-start' : ''
-            }`}
-            onClick={() => setPos(i)}
-          >
-            {i % 2 === 0 ? i / 2 + 1 : 'e'}
-          </button>
-        ))}
-      </div>
-      {pos + dur > barEighths && <div className="stc__more muted">…continua nella bar dopo</div>}
-      <div className="stc__label">Quanto dura</div>
-      <div className="show-pick__grid">
-        {durs.map((d) => (
-          <button key={d} type="button" className={`chip chip--sm ${d === dur ? 'is-on' : ''}`} onClick={() => setDur(d)}>
-            {eighthsLabel(d, barEighths)}
-          </button>
-        ))}
-      </div>
-      {gen && (
-        <>
-          <div className="stc__label">Chi si ferma</div>
-          <div className="show-pick__grid stc__who">
-            {[
-              ['all', 'Tutti (looper + drum)'],
-              ['loopers', 'Solo i looper'],
-              ['drum', 'Solo la drum'],
-            ].map(([k, label]) => (
-              <button key={k} type="button" className={`chip chip--sm ${who === k ? 'is-on' : ''}`} onClick={() => setWho(k)}>
-                {label}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-      <button type="button" className="chip chip--ok stc__go" onClick={() => onAdd(stacArg(pos, dur, gen ? who : 'loopers'))}>
-        Metti lo stacco
-      </button>
-    </div>
-  );
-}
-
 // Drum machine: provare un pattern al volo e regolare come arriva il cambio
-function DrumBox({ uno, gate, sync, send }) {
+function DrumBox({ uno, gate, sync, send, vst }) {
   const [n, setN] = useState(1);
   const ofs = uno?.ofs || 0;
   const lead = uno?.lead || 0;
@@ -136,7 +35,7 @@ function DrumBox({ uno, gate, sync, send }) {
         </button>
         <span className="muted">anche tenendo premuto Drum</span>
       </div>
-      <div className="drumbox__row">
+      {!vst && <div className="drumbox__row">
         <span>Dopo un buco audio di REAPER</span>
         <button type="button" className={`chip chip--sm ${auto ? 'is-on' : ''}`} onClick={() => setSync(1, plen)}>
           Rimettila da sola
@@ -144,7 +43,7 @@ function DrumBox({ uno, gate, sync, send }) {
         <button type="button" className={`chip chip--sm ${!auto ? 'is-on' : ''}`} onClick={() => setSync(0, plen)}>
           Solo a mano
         </button>
-      </div>
+      </div>}
       <div className="drumbox__row">
         <span>Il pattern della drum dura</span>
         {[1, 2, 4, 8].map((b) => (
@@ -155,18 +54,19 @@ function DrumBox({ uno, gate, sync, send }) {
       </div>
       {sync && (
         <div className="muted">
-          Buchi audio visti: {sync.x} · rimessa a tempo: {sync.n}
+          {vst ? '' : `Buchi audio visti: ${sync.x} · `}rimessa a tempo: {sync.n}
           {sync.miss ? ` · non partite: ${sync.miss}` : ''}
-          {!sync.out ? ' · manca l\'uscita MIDI della traccia drum verso la UNO' : ''}
+          {!sync.out && !vst ? ' · manca l\'uscita MIDI della traccia drum verso la UNO' : ''}
         </div>
       )}
       <div className="drumbox__row">
         <strong>Drum machine</strong>
         <span className="muted">
           {!uno ? '' : uno.api === 0 ? 'REAPER troppo vecchio per mandare i pattern'
-            : uno.dev >= 0 ? `uscita MIDI: ${uno.name}` : 'UNO Drum non trovata tra le uscite MIDI di REAPER'}
+            : uno.dev >= 0 ? `uscita MIDI: ${uno.name}`
+            : `UNO Drum non trovata tra le uscite MIDI di ${vst ? 'Windows' : 'REAPER'}`}
           {uno && uno.last > 0 ? ` · ultimo pattern ${uno.last}` : ''}
-          {uno && uno.route ? ` (${uno.route === 'gate' ? 'dal gate della traccia drum' : 'diretto'})` : ''}
+          {uno && uno.route && !vst ? ` (${uno.route === 'gate' ? 'dal gate della traccia drum' : 'diretto'})` : ''}
           {gate ? ' · gate per gli stacchi ok' : ''}
         </span>
       </div>
@@ -212,12 +112,15 @@ function DrumBox({ uno, gate, sync, send }) {
 }
 
 // Synth: i suoni salvati (preset di REAPER del plugin), caricarli e salvarne di nuovi
-function SynthBox({ synth, send }) {
+function SynthBox({ synth, send, vst }) {
   const [del, setDel] = useState(false);
   if (!synth || !synth.ok) {
     return (
       <div className="drumbox">
-        <span className="muted">Non trovo una traccia "synth" con Splice INSTRUMENT o LABS.</span>
+        <span className="muted">
+          {vst ? 'Il cambio suono del synth funziona solo in REAPER: in Ableton cambialo dal plugin.'
+            : 'Non trovo una traccia "synth" con Splice INSTRUMENT o LABS.'}
+        </span>
       </div>
     );
   }
@@ -263,27 +166,30 @@ function SynthBox({ synth, send }) {
   );
 }
 
-function valueLabel(e, barEighths = 8, synthList = []) {
-  if (e.t === EV.FADE_IN || e.t === EV.FADE_OUT) return `${fadeLabel(e.v / 2)} bar`;
-  if (e.t === EV.FILTER || (e.t >= EV.EQ_LO && e.t <= EV.EQ_HI)) {
-    const { val, bars } = fxEvParts(e.v);
-    const base = e.t === EV.FILTER
-      ? (FILTER_PRESETS.find((p) => p.v === val) || {}).label || `${val}`
-      : (EQ_PRESETS.find((p) => p.v === val) || {}).label || `${val}%`;
-    return `${base} · ${bars > 0 ? `in ${fadeLabel(bars)} bar` : 'subito'}`;
+const DRAFT_KEY = 'mylooper.show.draft';
+function loadDraft() {
+  try {
+    const d = JSON.parse(window.localStorage.getItem(DRAFT_KEY) || 'null');
+    return d && d.show && Array.isArray(d.show.events) ? d : null;
+  } catch {
+    return null;
   }
-  if (e.t === EV.DRUMS) return e.v ? 'in play' : 'in pausa';
-  if (e.t === EV.TEMPO) return `${Math.round(e.v / 100)} BPM`;
-  if (e.t === EV.PATTERN) return `pattern ${e.v}`;
-  if (e.t === EV.STACCO) return staccoLabel(e.v, barEighths);
-  if (e.t === EV.SYNTH) return (synthList.find((x) => x.id === e.v) || {}).name || `suono ${e.v} (non c'è più)`;
-  return '';
+}
+function saveDraft(d) {
+  try {
+    window.localStorage.setItem(DRAFT_KEY, JSON.stringify(d));
+  } catch {
+    // niente spazio o storage bloccato: pazienza, resta in memoria
+  }
 }
 
 export default function ShowPanel({ state, send, client, onClose }) {
+  const vst = state?.host === 'vst3';   // the VST3 plug-in (Ableton): no tempo / synth / transport from here
   const loopers = useMemo(() => state?.loopers || [], [state]);
+  const machines = useMemo(() => state?.machines || [], [state]);
   const live = state?.show;
-  const [show, setShow] = useState(() => ({ name: 'Scaletta 1', bars: 32, tempo: 0, events: [] }));
+  // la scaletta nell'editor sopravvive a chiusura del pannello e ricarica della pagina
+  const [show, setShow] = useState(() => loadDraft()?.show || { name: 'Scaletta 1', bars: 32, tempo: 0, events: [] });
   // modifiche annullabili (aggiungi, togli, cancella selezione, incolla, unisci)
   const hist = useRef([]);
   const [histN, setHistN] = useState(0);
@@ -308,7 +214,27 @@ export default function ShowPanel({ state, send, client, onClose }) {
   const [startFrom, setStartFrom] = useState(null);
   const drag = useRef(null);
   const skipClick = useRef(false);
-  const [extraRows, setExtraRows] = useState([]);
+  const [extraRows, setExtraRows] = useState(() => loadDraft()?.extraRows || []);
+  useEffect(() => saveDraft({ show, extraRows }), [show, extraRows]);
+  // se in REAPER sta suonando una scaletta, l'editor mostra quella (es. dopo una ricarica
+  // della pagina, o se l'iPad aveva un'altra scaletta aperta)
+  const synced = useRef(false);
+  useEffect(() => {
+    if (synced.current || !live || !live.st || !client || !client.getShow) return;
+    synced.current = true;
+    client
+      .getShow()
+      .then((text) => {
+        const sh = parseShow(text);
+        if (sh && serializeShow(sh) !== serializeShow(show)) {
+          setShow(sh);
+          setExtraRows([]);
+          setBusy(`Aperta "${sh.name}", quella che sta suonando`);
+          setTimeout(() => setBusy(''), 3000);
+        }
+      })
+      .catch(() => {});
+  }, [live, client, show]);
   const [pick, setPick] = useState(null);     // { key, bar, l, s, step, t }
   const [addRow, setAddRow] = useState(false);
   const [saveTo, setSaveTo] = useState(false);
@@ -352,11 +278,11 @@ export default function ShowPanel({ state, send, client, onClose }) {
         }
         if (code) send(ALL_LOOPERS, code, arg);
       } catch {
-        setBusy('Non riesco a mandarla a REAPER');
+        setBusy(vst ? 'Non riesco a mandarla al plugin' : 'Non riesco a mandarla a REAPER');
         setTimeout(() => setBusy(''), 2500);
       }
     },
-    [client, send, show]
+    [client, send, show, vst]
   );
 
   // Unisci: carica l'altra scaletta dal disco e la mette prima o dopo questa, nell'editor
@@ -423,10 +349,16 @@ export default function ShowPanel({ state, send, client, onClose }) {
         color: lp?.color || 'var(--accent)',
       });
     };
-    show.events.forEach((e) => e.l > 0 && add(e.l, e.s));
-    extraRows.forEach((r) => add(r.l, r.s));
+    const addMachine = (id) => {
+      const k = rowKey(MACHINE_ROW, id);
+      if (seen.has(k)) return;
+      const m = machines.find((x) => x.id === id);
+      seen.set(k, { key: k, l: MACHINE_ROW, s: id, label: m ? m.name : `Macchina ${id}`, color: '#f59e0b', machine: true });
+    };
+    show.events.forEach((e) => (e.l === MACHINE_ROW ? addMachine(e.s) : e.l > 0 && add(e.l, e.s)));
+    extraRows.forEach((r) => (r.l === MACHINE_ROW ? addMachine(r.s) : add(r.l, r.s)));
     return [...seen.values()];
-  }, [show.events, extraRows, loopers]);
+  }, [show.events, extraRows, loopers, machines]);
 
   const bars = Math.max(4, Math.min(256, show.bars || 32));
   const barList = useMemo(() => Array.from({ length: bars }, (_, i) => i + 1), [bars]);
@@ -591,13 +523,10 @@ export default function ShowPanel({ state, send, client, onClose }) {
     return `${n} bar (fino alla bar ${next.bar})`;
   };
 
-  const actionsFor = (row) => (row.key === GEN ? GEN_ACTIONS : row.s >= 0 ? SEC_ACTIONS : LOOP_ACTIONS);
-  const presetsFor = (t) =>
-    t === EV.FILTER ? FILTER_PRESETS
-    : t >= EV.EQ_LO && t <= EV.EQ_HI ? EQ_PRESETS
-    : t === EV.DRUMS ? DRUM_PRESETS
-    : t === EV.FADE_IN || t === EV.FADE_OUT ? FADE_STEPS.map((b) => ({ v: b * 2, label: `${fadeLabel(b)} bar` }))
-    : [];
+  const actionsFor = (row) =>
+    row.machine ? MACH_ACTIONS
+    : row.key === GEN ? GEN_ACTIONS.filter((t) => !vst || t !== EV.SYNTH)
+    : row.s >= 0 ? SEC_ACTIONS : LOOP_ACTIONS;
 
   return (
     <div className="overlay" onClick={onClose}>
@@ -832,7 +761,8 @@ export default function ShowPanel({ state, send, client, onClose }) {
                   >
                     {evs.map((e) => (
                       <span key={e.i} className={`showev showev--${EV_INFO[e.t]?.cls}`}>
-                        {e.t === EV.PATTERN ? `P${e.v}` : EV_INFO[e.t]?.icon}
+                        {e.t === EV.PATTERN ? `P${e.v}` : e.t === EV.MACHINE_RUN ? (e.v ? '▶M' : '■M')
+                          : e.t === EV.DRUMS && e.l === MACHINE_ROW ? (e.v ? 'ON' : 'OFF') : EV_INFO[e.t]?.icon}
                       </span>
                     ))}
                   </button>
@@ -847,7 +777,7 @@ export default function ShowPanel({ state, send, client, onClose }) {
 
         <div className="show-legend">
           <span className="muted">Tocca una casella per decidere cosa succede a quella bar.</span>
-          {[EV.REC, EV.PLAY, EV.PAUSE, EV.CLEAR, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.PATTERN, EV.SYNTH, EV.WAIT].map((t) => (
+          {[EV.REC, EV.PLAY, EV.PAUSE, EV.CLEAR, EV.STACCO, EV.FADE_IN, EV.FADE_OUT, EV.PATTERN, vst ? EV.MACHINE_RUN : EV.SYNTH, EV.WAIT].map((t) => (
             <span key={t} className="show-legend__item">
               <span className={`showev showev--${EV_INFO[t].cls}`}>{EV_INFO[t].icon}</span>
               {EV_INFO[t].label}
@@ -856,178 +786,35 @@ export default function ShowPanel({ state, send, client, onClose }) {
         </div>
 
         <button type="button" className={`chip chip--sm drumbox__toggle ${drumOpen ? 'is-on' : ''}`} onClick={() => setDrumOpen((o) => !o)}>
-          Drum machine {drumOpen ? '▴' : '▾'}
+          {vst ? 'Macchine e Ableton' : 'Drum machine'} {drumOpen ? '▴' : '▾'}
         </button>
         <button type="button" className={`chip chip--sm drumbox__toggle ${synthOpen ? 'is-on' : ''}`} onClick={() => setSynthOpen((o) => !o)}>
           Synth {synthOpen ? '▴' : '▾'}
         </button>
-        {drumOpen && <DrumBox uno={state?.drums?.uno} gate={state?.drums?.gate} sync={state?.drums?.sync} send={send} />}
-        {synthOpen && <SynthBox synth={state?.synth} send={send} />}
+        {drumOpen && !vst && <DrumBox uno={state?.drums?.uno} gate={state?.drums?.gate} sync={state?.drums?.sync} send={send} vst={vst} />}
+        {drumOpen && vst && <MachinesBox state={state} send={send} client={client} />}
+        {synthOpen && <SynthBox synth={state?.synth} send={send} vst={vst} />}
 
         {/* scelta dell'azione per una casella */}
         {pick && (
-          <div className="show-pick" onClick={() => setPick(null)}>
-            <div className="show-pick__box" onClick={(e) => e.stopPropagation()}>
-              <div className="show-pick__head">
-                <strong>{pick.row.label}</strong>
-                <span className="muted"> · bar {pick.bar}</span>
-              </div>
-
-              {pick.evs.length > 0 && (
-                <div className="show-pick__list">
-                  {pick.evs.map((e) => (
-                    <div className="show-pick__ev" key={e.i}>
-                      <span className={`showev showev--${EV_INFO[e.t]?.cls}`}>{EV_INFO[e.t]?.icon}</span>
-                      {EV_INFO[e.t]?.label}
-                      {needsValue(e.t) && <small> · {valueLabel(e, barEighths, synthList)}</small>}
-                      {(e.t === EV.REC || e.t === EV.CUE_REC) && <small> · {recLenLabel(e)}</small>}
-                      <button type="button" className="chip chip--danger" onClick={() => removeEvent(e.i)}>
-                        Togli
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {!pick.t ? (
-                <>
-                  <div className="show-pick__grid">
-                    {actionsFor(pick.row).map((t) => (
-                      <button
-                        key={t}
-                        type="button"
-                        className={`chip showev-btn showev-btn--${EV_INFO[t].cls}`}
-                        onClick={() => (needsValue(t) ? setPick({ ...pick, t }) : addEvent(pick.row, pick.bar, t))}
-                      >
-                        <span className={`showev showev--${EV_INFO[t].cls}`}>{EV_INFO[t].icon}</span>
-                        {EV_INFO[t].label}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              ) : pick.t === EV.STACCO ? (
-                <StaccoPicker
-                  barEighths={barEighths}
-                  gen={pick.row.key === GEN}
-                  onAdd={(v) => addEvent(pick.row, pick.bar, EV.STACCO, v)}
-                />
-              ) : pick.t === EV.SYNTH ? (
-                <div className="show-pick__grid">
-                  {synthList.length === 0 && (
-                    <span className="muted">
-                      Ancora nessun suono salvato: apri "Synth" sotto la griglia e salva i suoni che usi.
-                    </span>
-                  )}
-                  {synthList.map((x) => (
-                    <button key={x.id} type="button" className="chip" onClick={() => addEvent(pick.row, pick.bar, EV.SYNTH, x.id)}>
-                      {x.name}
-                    </button>
-                  ))}
-                </div>
-              ) : pick.t === EV.PATTERN ? (
-                <div className="show-pick__grid">
-                  <input
-                    className="show-name drumbox__num"
-                    type="number"
-                    min="1"
-                    max="100"
-                    defaultValue={state?.drums?.uno?.last || 1}
-                    id="show-pat"
-                    onKeyDown={(e) =>
-                      e.key === 'Enter' &&
-                      addEvent(pick.row, pick.bar, EV.PATTERN, Math.max(1, Math.min(100, Number(e.target.value) || 1)))
-                    }
-                  />
-                  <button
-                    type="button"
-                    className="chip"
-                    onClick={() =>
-                      addEvent(
-                        pick.row,
-                        pick.bar,
-                        EV.PATTERN,
-                        Math.max(1, Math.min(100, Number(document.getElementById('show-pat').value) || 1))
-                      )
-                    }
-                  >
-                    Vai a questo pattern
-                  </button>
-                  <button
-                    type="button"
-                    className="chip chip--sm"
-                    onClick={() => send(ALL_LOOPERS, CMD.UNO_PATTERN, Number(document.getElementById('show-pat').value) || 1)}
-                  >
-                    Provalo adesso
-                  </button>
-                </div>
-              ) : pick.t === EV.TEMPO ? (
-                <div className="show-pick__grid">
-                  <input
-                    className="show-name"
-                    type="number"
-                    min="20"
-                    max="300"
-                    defaultValue={Math.round(state?.tempo || 120)}
-                    onKeyDown={(e) => e.key === 'Enter' && addEvent(pick.row, pick.bar, EV.TEMPO, Number(e.target.value) * 100)}
-                    id="show-bpm"
-                  />
-                  <button
-                    type="button"
-                    className="chip"
-                    onClick={() =>
-                      addEvent(pick.row, pick.bar, EV.TEMPO, Number(document.getElementById('show-bpm').value) * 100)
-                    }
-                  >
-                    Metti questo BPM
-                  </button>
-                </div>
-              ) : isFx(pick.t) && pick.val !== undefined ? (
-                <>
-                  <div className="stc__label">
-                    Transizione <span className="muted">· {pick.valLabel}</span>
-                  </div>
-                  <div className="show-pick__grid">
-                    <button
-                      type="button"
-                      className="chip"
-                      onClick={() => addEvent(pick.row, pick.bar, pick.t, fxEvArg(pick.val, 0))}
-                    >
-                      Subito
-                    </button>
-                    {FADE_STEPS.map((b) => (
-                      <button
-                        key={b}
-                        type="button"
-                        className="chip"
-                        onClick={() => addEvent(pick.row, pick.bar, pick.t, fxEvArg(pick.val, b))}
-                      >
-                        in {fadeLabel(b)} bar
-                      </button>
-                    ))}
-                  </div>
-                </>
-              ) : (
-                <div className="show-pick__grid">
-                  {presetsFor(pick.t).map((p) => (
-                    <button
-                      key={p.v}
-                      type="button"
-                      className="chip"
-                      onClick={() =>
-                        isFx(pick.t)
-                          ? setPick({ ...pick, val: p.v, valLabel: p.label })
-                          : addEvent(pick.row, pick.bar, pick.t, p.v)
-                      }
-                    >
-                      {p.label}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
+          <EventPicker
+            row={pick.row}
+            barLabel={`bar ${pick.bar}`}
+            evs={pick.evs}
+            actions={actionsFor(pick.row)}
+            gen={pick.row.key === GEN}
+            onAdd={(t, v) => addEvent(pick.row, pick.bar, t, v)}
+            onRemove={(e) => removeEvent(e.i)}
+            onClose={() => setPick(null)}
+            barEighths={barEighths}
+            synthList={synthList}
+            machines={machines}
+            state={state}
+            send={send}
+            vst={vst}
+            recLenLabel={recLenLabel}
+          />
         )}
-
         {/* aggiungere una riga */}
         {addRow && (
           <div className="show-pick" onClick={() => setAddRow(false)}>
@@ -1036,6 +823,20 @@ export default function ShowPanel({ state, send, client, onClose }) {
                 <strong>Aggiungi una riga</strong>
               </div>
               <div className="show-pick__grid">
+                {machines.map((m) => (
+                  <button
+                    key={`m${m.id}`}
+                    type="button"
+                    className="chip chip--sec"
+                    style={{ '--track': '#f59e0b' }}
+                    onClick={() => {
+                      setExtraRows((r) => [...r, { l: MACHINE_ROW, s: m.id }]);
+                      setAddRow(false);
+                    }}
+                  >
+                    {m.name}
+                  </button>
+                ))}
                 {loopers.map((l) => (
                   <button
                     key={`l${l.id}`}

@@ -2419,3 +2419,236 @@
 .show-tools .chip:disabled {
   opacity: 0.35;
 }
+
+/* Macchine e Ableton (plug-in VST3) */
+.mbox__sel {
+  min-height: 34px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: inherit;
+  font: inherit;
+}
+.mbox__help {
+  font-size: 12px;
+  line-height: 1.45;
+}
+.mcard {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid #f59e0b;
+  border-radius: 10px;
+}
+.mcard__name {
+  flex: 1 1 160px;
+  max-width: 260px;
+}
+.mbox .drumbox__num {
+  min-width: 0;
+  flex: 0 0 80px;
+  width: 80px;
+}
+.mbox__ok {
+  color: var(--play, #22c55e);
+  font-weight: 700;
+}
+
+/* ---------- licence (GL-8 plug-in) ---------- */
+.lic {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: radial-gradient(ellipse at 50% 30%, #1b2140 0%, var(--bg) 70%);
+}
+.lic__card {
+  box-sizing: border-box;
+  width: min(520px, 100%);
+  padding: 28px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+.lic__brand {
+  font-weight: 800;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+.lic__brand span {
+  margin-left: 6px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.lic__title {
+  margin: 14px 0 8px;
+  font-size: 26px;
+  font-weight: 800;
+}
+.lic__text {
+  font-size: 15px;
+  line-height: 1.5;
+  color: #c9cedb;
+}
+.lic__text a {
+  color: var(--accent);
+}
+.lic__url {
+  display: block;
+  margin: 14px 0 6px;
+  font-weight: 700;
+  word-break: break-all;
+}
+.lic__code {
+  display: block;
+  margin: 10px 0;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  text-align: center;
+  font: 800 34px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.12em;
+  color: var(--text);
+}
+.lic__wait {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  animation: lic-pulse 1.6s ease-in-out infinite;
+}
+@keyframes lic-pulse {
+  50% { opacity: 0.4; }
+}
+.lic__err {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--c-rec) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--c-rec) 40%, transparent);
+  color: #fecaca;
+  font-size: 14px;
+}
+.lic__actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}
+.lic__btn {
+  min-height: 48px;
+  padding: 0 22px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+  font-size: 16px;
+  cursor: pointer;
+}
+.lic__btn.is-primary {
+  flex: 1;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #0a0b0e;
+}
+.lic__foot {
+  margin-top: 18px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.lic-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+  color: var(--muted);
+}
+.lic-line strong {
+  color: var(--text);
+}
+.lic-line__actions {
+  display: flex;
+  gap: 8px;
+}
+.lic-line a.chip {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+/* ---------- Improv ---------- */
+.imp-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.imp-tabs .chip {
+  height: 40px;
+  border-left: 3px solid var(--track, var(--line));
+}
+.imp-tabs__n {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #0a0b0e;
+  font-size: 11px;
+  font-weight: 800;
+}
+.chip--improv.is-on {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.impgrid {
+  max-height: 60vh;
+}
+.impgrid .showgrid__rowlabel.is-empty {
+  color: var(--muted);
+  font-weight: 600;
+}
+.impgrid .showgrid__cell:disabled {
+  opacity: 0.55;
+}
+.imp-off {
+  margin: 14px 0;
+  padding: 18px;
+  border-radius: 14px;
+  border: 1px dashed var(--line);
+  color: var(--muted);
+  text-align: center;
+}
+.imp-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 8px;
+  font-size: 13px;
+}
+@media (min-width: 900px) {
+  .impgrid .showgrid__cell,
+  .impgrid .showgrid__col {
+    width: 46px;
+  }
+  .impgrid .showgrid__cell {
+    height: 44px;
+  }
+}

@@ -1,4 +1,4 @@
-desc:MyLooper - 8-section tempo-synced looper, controlled from iPad (inspired by Cockos Super8)
+desc:GL-8 Giro Looper 8 - 8-section tempo-synced looper, controlled from iPad
 //author: Antonio
 //tags: looper
 //
@@ -251,14 +251,17 @@ function grid_len(s, act) ( new_take(s, act) || SLEN[s] <= 0 ? len : SLEN[s] );
 
 // apply the last d input samples (pre-roll) to cells 0..d-1 of section s
 // mode: 0 = overwrite, 1 = add, -1 = subtract
-function retro(s, d, mode) local(bl, br, k, i)
+function retro(s, d, mode) local(bl, br, k, i, z)
 (
   d = min(d|0, SLEN[s]);
   d > 0 ? (
     bl = bufl(s); br = bufr(s);
-    i = pr_w - d; i < 0 ? i += PR_LEN;
-    k = 0;
-    loop(d,
+    // older than the pre-roll ring (a booked rec reached very late): nothing to put there
+    z = max(0, d - PR_LEN);
+    mode == 0 && z > 0 ? ( memset(bl, 0, z); memset(br, 0, z); );
+    i = pr_w - (d - z); i < 0 ? i += PR_LEN;
+    k = z;
+    loop(d - z,
       mode == 0 ? (
         bl[k] = PRL[i]; br[k] = PRR[i];
       ) : (
@@ -1168,7 +1171,7 @@ gfx_rect(0, 0, gfx_w, gfx_h);
 gfx_set(0.85);
 gfx_x = 8; gfx_y = 8;
 gv_b = cur_beats();
-gfx_printf("MyLooper  ID %d   %s   rec: ", looper_id|0, quant_mode ? "BAR" : "IMMEDIATE");
+gfx_printf("GL-8  ID %d   %s   rec: ", looper_id|0, quant_mode ? "BAR" : "IMMEDIATE");
 (gv_b / ts_num) == floor(gv_b / ts_num) ? gfx_printf("%d bar", gv_b / ts_num) :
   gv_b == floor(gv_b) ? gfx_printf("%d beat", gv_b) : gfx_printf("%.1f beat", gv_b);
 running ? 0 : gfx_drawstr("   (transport stopped)");

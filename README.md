@@ -160,6 +160,12 @@ Non serve nessun server esterno: la pagina la serve REAPER, lo script Lua fa da 
     prenotato per la bar dopo viene annullato e tutto il resto della scaletta slitta. Fade, filtri ed EQ già
     partiti restano come sono.
   - mentre gira puoi sempre intervenire a mano con i pulsanti: la scaletta non blocca niente.
+- **Improv** (tasto sulla pagina di ogni strumento): una scaletta per il live, per ispirazione. Mostra le
+  **prossime 16 bar** della traccia (tutta e le 8 sezioni) e, nella scheda *Generale*, drum, BPM, stacchi,
+  synth ed effetti. Tocchi una casella e scegli l'azione come nella scaletta: succede su quella bar. Le bar
+  scorrono (quello che hai messo si avvicina, a destra arrivano le nuove), funziona anche **sopra una scaletta
+  che sta suonando**, non ci sono attese, e allo Stop si svuota. Il bridge la fa girare con lo stesso motore
+  della scaletta (comandi 250 e 251, ExtState `improv_*`), sulle battute del progetto.
 - **Drum e tempo**: la UNO segue il MIDI clock *contando i tick*, non sa dov'è la bar. Per questo il Play dall'iPad
   (e quello automatico) riparte sempre dall'inizio della bar, e un cambio di BPM fatto mentre suona (scaletta,
   memorie) diventa un marker di tempo su una stanghetta: così la griglia non salta sotto i piedi della drum. I

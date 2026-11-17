@@ -49,7 +49,26 @@ export const CMD = {
   SYNTH_SAVE: 220,  // bridge: save the current sound of the synth as a preset
   SYNTH_LOAD: 221,  // bridge: load sound id
   SYNTH_DELETE: 222, // bridge: delete sound id
+  // VST3 plug-in only (Ableton): machines and the MIDI mapping of Ableton
+  MACHINE_SET: 230,     // settings from the ExtState "mcfg": id|name|track|port|ch|pat|lead|ofs|ss
+  MACHINE_DEL: 231,     // arg = machine id
+  MACHINE_ONOFF: 232,   // arg = machineArg(id, 0 off / 1 on / 2 switch): its audio, at the bar
+  MACHINE_RUN: 233,     // arg = machineArg(id, 1 start / 0 stop on the next bar, 2 start / 3 stop now)
+  MACHINE_PATTERN: 234, // arg = machineArg(id, pattern)
+  MACHINE_SYNC: 235,    // arg = machine id: Stop + Start on a bar line
+  TEMPO: 236,           // arg = bpm * 100, through the MIDI mapping of Ableton
+  CTL_SET: 237,
+  IMPROV_SET: 250,      // the Improv: read ExtState improv_* (its events from the current bar on)
+  IMPROV_CLEAR: 251,    // drop the Improv
+  LIC_ACTIVATE: 240,    // licence: ask the site for an activation code
+  LIC_CANCEL: 241,      // stop waiting for the confirmation
+  LIC_SIGN_OUT: 242,    // forget the licence on this computer
+  LIC_RETRY: 243,       // check again now (trial offline / trial over and bought)         // settings from the ExtState "ctlcfg": port|ch|min|max
+  CTL_LEARN: 238,       // arg 1 play, 2 stop, 3 tempo: the message once, for Ableton's MIDI Map
 };
+export const machineArg = (id, v) => id + 64 * v;
+// the rows of the scaletta for a machine: looper -1, section = machine id
+export const MACHINE_ROW = -1;
 
 export const ALL_LOOPERS = 0;
 
@@ -109,6 +128,7 @@ export const EV = {
   STACCO: 17,    // v = stacArg(pos, dur, drum): silence inside the bar
   SYNTH: 18,     // v = id of the synth sound
   CLEAR: 19,     // scarta: empties the section / the instrument / everything, on the bar
+  MACHINE_RUN: 20, // v 1 = MIDI Start, 0 = Stop of a machine, on the bar (plug-in only)
 };
 
 export const EV_INFO = {
@@ -131,6 +151,7 @@ export const EV_INFO = {
   [EV.STACCO]: { icon: 'STC', label: 'Stacco', cls: 'stacco' },
   [EV.SYNTH]: { icon: 'SYN', label: 'Suono synth', cls: 'synth' },
   [EV.CLEAR]: { icon: '✕', label: 'Scarta', cls: 'clear' },
+  [EV.MACHINE_RUN]: { icon: 'S/S', label: 'Start / Stop MIDI', cls: 'drum' },
 };
 
 // stacco: position and length in eighths (pos 0 = on the 1 of the bar), drum = the
@@ -184,6 +205,22 @@ export function parseShow(text) {
     : [];
   return { name: m[1], bars: Number(m[2]) || 32, tempo: Number(m[3]) || 0, events };
 }
+
+// ---------- Improv: the next 16 bars, written live ----------
+// state.improv = { now: bar of the song (0 = stopped), on, ev: "bar,t,l,s,v;..." }
+export const IMPROV_BARS = 16;
+export const evKey = (e) => `${e.bar},${e.t},${e.l},${e.s},${Math.round(e.v || 0)}`;
+export function parseImprov(ev) {
+  return (ev || '')
+    .split(';')
+    .filter(Boolean)
+    .map((x) => {
+      const p = x.split(',').map(Number);
+      return { bar: p[0], t: p[1], l: p[2], s: p[3], v: p[4] };
+    })
+    .filter((e) => e.bar > 0 && e.t > 0);
+}
+export const serializeImprov = (events) => `v1|improv|0|0|${events.map(evKey).join(';')}`;
 
 // TAP arg carries how long the UI held the tap back, so the JSFX can widen its grace window
 export const tapArg = (section, lateMs) => section + 8 * Math.round(lateMs);

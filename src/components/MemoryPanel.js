@@ -1,4 +1,5 @@
 import HoldButton from './HoldButton';
+import { LicenceLine } from './LicenceScreen';
 import { ALL_LOOPERS, CMD } from '../lib/protocol';
 
 const NSLOTS = 8;
@@ -47,11 +48,17 @@ export default function MemoryPanel({ state, send, onClose }) {
         <div className="slots">
           {slots.map((sl) => {
             const used = !!sl.saved;
+            const other = sl.saved === 'altro account';   // encrypted with another GL-8 account
             return (
               <div key={sl.slot} className={`slot ${used ? 'is-used' : ''}`}>
                 <div className="slot__num">{sl.slot}</div>
                 <div className="slot__info">
-                  {used ? (
+                  {other ? (
+                    <>
+                      <strong>Altro account</strong>
+                      <span>salvata con un altro account: si apre solo con quello</span>
+                    </>
+                  ) : used ? (
                     <>
                       <strong>{sl.saved}</strong>
                       <span>
@@ -75,7 +82,7 @@ export default function MemoryPanel({ state, send, onClose }) {
                   <HoldButton
                     ms={700}
                     className="chip chip--load"
-                    disabled={busy || !used}
+                    disabled={busy || !used || other}
                     onHold={() => send(ALL_LOOPERS, CMD.LOAD, sl.slot)}
                   >
                     Carica
@@ -85,6 +92,7 @@ export default function MemoryPanel({ state, send, onClose }) {
             );
           })}
         </div>
+        <LicenceLine state={state} send={send} />
       </div>
     </div>
   );

@@ -5,7 +5,7 @@ import FadeButton, { FadeLen } from './FadeButton';
 const CONN_LABEL = {
   ok: 'Connesso',
   connecting: 'Connessione…',
-  offline: 'REAPER non raggiungibile',
+  offline: 'Looper non raggiungibile',
   nobridge: 'Bridge Lua non attivo',
 };
 
@@ -50,7 +50,7 @@ export default function Header({
       <div className="header__brand">
         <span className={`dot dot--${conn}`} />
         <div>
-          <div className="brand">MyLooper{demo && <span className="badge">demo</span>}</div>
+          <div className="brand">GL-8{demo && <span className="badge">demo</span>}</div>
           <div className="header__conn">{CONN_LABEL[conn] || conn}</div>
         </div>
       </div>
@@ -58,8 +58,10 @@ export default function Header({
       <button
         type="button"
         className={`transport ${playing ? 'is-playing' : ''}`}
-        onClick={() => send(ALL_LOOPERS, CMD.TRANSPORT)}
-        aria-label={playing ? 'Ferma REAPER' : 'Avvia REAPER'}
+        onClick={() => (state?.host !== 'vst3' || state?.live?.on || state?.ctl?.ok) && send(ALL_LOOPERS, CMD.TRANSPORT)}
+        title={state?.host === 'vst3' && !state?.live?.on && !state?.ctl?.ok
+          ? 'Play e stop da Ableton (o collega il Remote Script: Scaletta → Macchine e Ableton)' : undefined}
+        aria-label={state?.host === 'vst3' ? (playing ? 'Ferma Ableton' : 'Avvia Ableton') : playing ? 'Ferma REAPER' : 'Avvia REAPER'}
       >
         <span className="transport__icon">{playing ? '■' : '▶'}</span>
         <span className="transport__text">

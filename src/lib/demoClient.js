@@ -1,6 +1,6 @@
 // Offline simulator with the same interface as ReaperClient (open the app with ?demo).
 // It mimics the JSFX logic: quantized commands wait for the end of the loop.
-import { CMD, EV, ST, PEND, parseShow, serializeShow } from './protocol';
+import { CMD, EV, ST, PEND, evKey, parseShow, serializeShow } from './protocol';
 
 const GRACE_S = 0.15;
 
@@ -62,6 +62,39 @@ export class DemoClient {
     this.showSlots = Array.from({ length: 8 }, (_, i) => ({ slot: i + 1 }));
     this.show = null;
     this.run = { st: 0, bar: 0 };
+    // Improv: a second scaletta on the bars of the song (bar 1 = when the demo started playing)
+    this.improvText = '';
+    this.ishow = null;
+    this.irun = { st: 0 };
+  }
+
+  async setImprov(text) {
+    this.improvText = text;
+  }
+
+  improvNow(tSec) {
+    return this.playing ? Math.floor(tSec / this.barSec()) + 1 : 0;
+  }
+
+  // the same runner as the scaletta, with show / run swapped
+  runImprov(tSec) {
+    if (!this.ishow) return;
+    if (!this.playing) {
+      this.ishow = null;
+      this.irun = { st: 0 };
+      return;
+    }
+    const swap = () => {
+      [this.show, this.ishow] = [this.ishow, this.show];
+      [this.run, this.irun] = [this.irun, this.run];
+    };
+    swap();
+    this.runShow(tSec);
+    swap();
+    if (this.ishow.events.every((_, i) => this.irun.fired[i])) {
+      this.ishow = null;
+      this.irun = { st: 0 };
+    }
   }
 
   async setShow(text) {
@@ -259,6 +292,7 @@ export class DemoClient {
       }
     }
     this.runShow(tSec);
+    this.runImprov(tSec);
     this.onUpdate(this.snapshot(), 'ok', now);
   }
 
@@ -289,6 +323,11 @@ export class DemoClient {
         done: this.run.ndone || 0,
         fall: 0,
         slots: this.showSlots,
+      },
+      improv: {
+        now: this.improvNow((performance.now() - this.t0) / 1000),
+        on: this.ishow ? 1 : 0,
+        ev: this.ishow ? this.ishow.events.map(evKey).join(';') : '',
       },
       drums: { ...this.drums, sync: { ...this.drums.sync }, uno: { ...this.uno } },
       synth: { ...this.synth, list: [...this.synth.list] },
@@ -435,9 +474,29 @@ export class DemoClient {
       this.uno.lead = Math.floor(arg / 2);
       return;
     }
+    if (code === CMD.IMPROV_SET || code === CMD.IMPROV_CLEAR) {
+      const t = (performance.now() - this.t0) / 1000;
+      if (code === CMD.IMPROV_CLEAR || !this.playing) {
+        this.ishow = null;
+        this.irun = { st: 0 };
+        return;
+      }
+      const now = this.improvNow(t);
+      const sh = parseShow(this.improvText);
+      const events = (sh ? sh.events : []).filter((e) => e.t !== EV.WAIT && e.bar >= now);
+      const done = new Set((this.ishow ? this.ishow.events : []).filter((_, i) => this.irun.fired[i]).map(evKey));
+      const fired = {};
+      events.forEach((e, i) => { if (done.has(evKey(e))) fired[i] = true; });
+      this.ishow = events.length ? { name: 'improv', bars: 0, tempo: 0, events } : null;
+      this.irun = events.length ? { st: 1, bar: 1, start: 0, paused: 0, fired } : { st: 0 };
+      return;
+    }
     if ((code >= CMD.SHOW_SET && code <= CMD.SHOW_CONTINUE) || code === CMD.SHOW_BACK) {
       const t = (performance.now() - this.t0) / 1000;
-      if (code === CMD.SHOW_SET) this.show = parseShow(this.showText);
+      if (code === CMD.SHOW_SET) {
+        this.show = parseShow(this.showText);
+        this.showData = this.showText;
+      }
       else if (code === CMD.SHOW_SAVE && this.show) {
         this.savedShows = this.savedShows || {};
         this.savedShows[arg] = serializeShow(this.show);

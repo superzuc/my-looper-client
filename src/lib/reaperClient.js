@@ -40,17 +40,32 @@ export class ReaperClient {
   // truncated, so its last events got lost. It goes in small pieces: show_0, show_1, ...
   // and show_n (how many) last; the bridge puts them back together.
   async setShow(text) {
+    return this.setChunks('show', text);
+  }
+
+  // the Improv: the same way, improv_0 ... improv_n
+  async setImprov(text) {
+    return this.setChunks('improv', text);
+  }
+
+  async setChunks(key, text) {
     const CHUNK = 200;
     const parts = [];
     for (let i = 0; i < text.length; i += CHUNK) parts.push(text.slice(i, i + CHUNK));
     if (!parts.length) parts.push('');
     for (let i = 0; i < parts.length; i++) {
-      const res = await fetch(`/_/SET/EXTSTATE/${SECTION}/show_${i}/${encodeURIComponent(parts[i])}`, {
+      const res = await fetch(`/_/SET/EXTSTATE/${SECTION}/${key}_${i}/${encodeURIComponent(parts[i])}`, {
         cache: 'no-store',
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     }
-    const res = await fetch(`/_/SET/EXTSTATE/${SECTION}/show_n/${parts.length}`, { cache: 'no-store' });
+    const res = await fetch(`/_/SET/EXTSTATE/${SECTION}/${key}_n/${parts.length}`, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  }
+
+  // any setting too long or too free for the command channel (machines, MIDI mapping)
+  async setExt(key, value) {
+    const res = await fetch(`/_/SET/EXTSTATE/${SECTION}/${key}/${encodeURIComponent(value)}`, { cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   }
 
